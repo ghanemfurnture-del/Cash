@@ -50,3 +50,4 @@ describe('Accounting Decimal Math (Arbitrary Precision)', () => {
     expect(qty).toBe('150.5');
   });
 });
+

@@ -2,23 +2,35 @@ import Decimal from 'decimal.js';
 
 /**
  * Global Configuration for Accounting and ERP Math
- * Configurable parameters with documented defaults.
- * Rounded using standard arithmetic Half-Up (ROUND_HALF_UP).
+ *
+ * CRITICAL ETA COMPLIANCE NOTICE:
+ * All rounding modes, decimal precisions, and calculation tolerances below
+ * are currently UNVERIFIED PLACEHOLDERS based on preliminary SDK references.
+ *
+ * WHAT MUST BE VERIFIED AGAINST OFFICIAL ETA SDK (sdk.invoicing.eta.gov.eg) BEFORE PHASE 11:
+ * 1. Required arithmetic rounding mode: ROUND_HALF_UP vs Banker's ROUND_HALF_EVEN vs truncation.
+ * 2. Unit price precision: whether ETA strictly requires 5 decimal places (e.g. 10.50000) or accepts 2-5.
+ *    If 5 decimals are confirmed, propose a new numbered migration 004_eta_unit_price_decimals.sql (DO NOT edit 001/002).
+ * 3. Calculation cross-check rules: formula for line netAmount and acceptable delta threshold (e.g. ±0.01 EGP).
+ * 4. Canonical string serialization algorithm (RFC 8785 vs custom JSON canonicalization).
+ * 5. Signature type: CAdES-BES (DER vs Base64-wrapped CMS).
+ * 6. Document versions: e-invoice v1.0 and POS e-receipt v1.2 / v1.0.
  */
 export const MathConfig = {
-  // Precision settings
-  moneyDecimals: 2,           // Standard Egyptian Pound (EGP) currency display & storage
-  unitPriceDecimals: 4,       // Unit price precision in documents (configurable up to 5/6)
-  quantityDecimals: 4,        // Quantity precision for inventory & conversions
-  exchangeRateDecimals: 6,    // Currency exchange rates
-  taxRateDecimals: 4,         // Tax percentages (e.g. 0.1400 for VAT 14%)
-  
-  // Rounding mode: 4 = ROUND_HALF_UP
+  // Precision settings [UNVERIFIED ETA PLACEHOLDER - MUST BE VERIFIED BEFORE PHASE 11]
+  moneyDecimals: 2,           // [UNVERIFIED ETA PLACEHOLDER] Egyptian Pound (EGP) document display/totals
+  unitPriceDecimals: 4,       // [UNVERIFIED ETA PLACEHOLDER] Unit price precision (may need 5 in Phase 11)
+  quantityDecimals: 4,        // Quantity precision for inventory movements and unit conversions
+  exchangeRateDecimals: 6,    // Foreign exchange rate precision
+  taxRateDecimals: 4,         // [UNVERIFIED ETA PLACEHOLDER] Tax percentages (e.g. 0.1400 for VAT 14%)
+  calculationTolerance: 0.01, // [UNVERIFIED ETA PLACEHOLDER] Allowable document rounding drift
+
+  // Rounding mode: 4 = ROUND_HALF_UP [UNVERIFIED ETA PLACEHOLDER - MUST BE VERIFIED BEFORE PHASE 11]
   roundingMode: Decimal.ROUND_HALF_UP,
   maxCalculationPrecision: 20,
 };
 
-// Apply default Decimal.js configuration
+// Apply configured Decimal.js settings
 Decimal.set({
   precision: MathConfig.maxCalculationPrecision,
   rounding: MathConfig.roundingMode,

@@ -89,3 +89,4 @@ export const SyncStatusPill: React.FC = () => {
     </div>
   );
 };
+

@@ -283,3 +283,4 @@ export class CashERPDatabase extends Dexie {
 }
 
 export const db = new CashERPDatabase();
+

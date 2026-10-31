@@ -157,3 +157,4 @@ export const Navbar: React.FC<{ onOpenCommandPalette?: () => void }> = ({ onOpen
     </header>
   );
 };
+

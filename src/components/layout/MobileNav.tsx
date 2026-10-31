@@ -50,3 +50,4 @@ export const MobileNav: React.FC<{ onOpenMore?: () => void }> = ({ onOpenMore })
     </nav>
   );
 };
+
