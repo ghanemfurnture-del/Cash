@@ -10,13 +10,22 @@ const IGNORED_PATHS = [
   'package-lock.json',
   '.system_generated',
   '.env.local', // Local dev file explicitly permitted on disk, but MUST NOT be tracked in git
+  'scripts/scan-secrets.js', // The scanner itself contains the regex patterns
+  'scripts\\scan-secrets.js',
 ];
 
 // Patterns that identify hardcoded secrets
 const SUSPICIOUS_PATTERNS = [
-  /eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_\-]{20,}/, // JWT / Supabase service keys
+  // 1. General JWT tokens starting with eyJ
+  /\beyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\b/,
+  // 2. Supabase secret service role keys / sb_secret_ pattern
+  /\bsb_secret_[a-zA-Z0-9_\-]{16,}\b/,
+  // 3. Supabase Personal Access Tokens (sbp_ pattern)
+  /\bsbp_[a-zA-Z0-9_\-]{16,}\b/,
+  // 4. RSA / Private keys
   /-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----/,
-  /postgres(?:ql)?:\/\/[a-zA-Z0-9_]+:[^@\s]{4,}@[a-zA-Z0-9.\-_]+/, // DB connection with real password
+  // 5. Database connection string with raw password
+  /postgres(?:ql)?:\/\/[a-zA-Z0-9_]+:[^@\s]{4,}@[a-zA-Z0-9.\-_]+/,
 ];
 
 function checkGitTrackedEnvFiles() {
@@ -42,7 +51,7 @@ function scanDirectory(dir) {
     const fullPath = path.join(dir, entry.name);
     const relativePath = path.relative(process.cwd(), fullPath);
 
-    if (IGNORED_PATHS.some((p) => relativePath.startsWith(p) || entry.name === p)) {
+    if (IGNORED_PATHS.some((p) => relativePath === p || relativePath.startsWith(p) || entry.name === p)) {
       continue;
     }
 

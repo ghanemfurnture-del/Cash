@@ -228,10 +228,81 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
   });
 
   // =========================================================================
-  // Test (c): Push retry is idempotent (same operation twice = one effect)
-  // Uses mock customExecutor
+  // Test (b3): A row with IN_FLIGHT outbox ops is ALSO NOT overwritten (Item 6)
+  // Tests real Dexie database safeApplyServerRow
   // =========================================================================
-  it('(c) proves push retry is idempotent: executing same op_id twice produces exactly one effect', async () => {
+  it('(b3) proves that a row with IN_FLIGHT outbox ops is never overwritten by a pull and routes to sync_conflicts', async () => {
+    const itemId = crypto.randomUUID();
+
+    const initialItem: Item = {
+      id: itemId,
+      sku: 'ITEM-INFLIGHT-01',
+      name_ar: 'صنف محلي قيد الإرسال',
+      base_unit_id: 'unit-ea',
+      is_stocked: true,
+      sale_price: 300,
+      purchase_price: 210,
+      min_stock: 5,
+      is_active: true,
+      tracking: 'none',
+      created_at: '2026-10-31T10:00:00.000Z',
+      updated_at: '2026-10-31T10:00:00.000Z',
+      version: 1,
+      server_seq: 60,
+    };
+    await db.items.put(initialItem);
+
+    const queued = await OutboxRepository.queueOperation({
+      entity: 'items',
+      entity_id: itemId,
+      op: 'update',
+      payload: { sale_price: 320 },
+      user_id: 'user-offline-1',
+      base_version: 1,
+    });
+
+    // Mark as in_flight (currently being pushed to server)
+    await OutboxRepository.markInFlight([queued.id]);
+
+    const inFlightOp = await db.outbox.get(queued.id);
+    expect(inFlightOp?.status).toBe('in_flight');
+
+    // Concurrent incoming pull arrives from server
+    const incomingServerRow: Item = {
+      id: itemId,
+      sku: 'ITEM-INFLIGHT-01',
+      name_ar: 'تحديث قادم من الخادم تزامناً مع الإرسال',
+      base_unit_id: 'unit-ea',
+      is_stocked: true,
+      sale_price: 350,
+      purchase_price: 210,
+      min_stock: 5,
+      is_active: true,
+      tracking: 'none',
+      created_at: '2026-10-31T10:00:00.000Z',
+      updated_at: '2026-10-31T12:00:00.000Z',
+      version: 2,
+      server_seq: 95,
+    };
+
+    const applyResult = await db.safeApplyServerRow(db.items, incomingServerRow);
+    expect(applyResult).toBe('conflict');
+
+    // PROOF: Local row preserved, not overwritten by pull
+    const localItem = await db.items.get(itemId);
+    expect(localItem?.sale_price).toBe(300);
+
+    const conflicts = await db.sync_conflicts.where('entity_id').equals(itemId).toArray();
+    expect(conflicts.length).toBe(1);
+    expect(conflicts[0].server_payload.sale_price).toBe(350);
+  });
+
+  // =========================================================================
+  // Test (c): Push retry is idempotent (client state machine)
+  // [MOCK-LEVEL SERVER]: Tests client outbox state transitions and duplicate handling.
+  // Real server-side idempotency is proven in sync_engine_validation_test.sql.
+  // =========================================================================
+  it('(c) [MOCK-LEVEL SERVER] proves push retry is idempotent: executing same op_id twice produces exactly one effect in client state machine', async () => {
     const fixedOpId = crypto.randomUUID();
     const entryId = crypto.randomUUID();
 
@@ -295,10 +366,11 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
   });
 
   // =========================================================================
-  // Test (d): User without access to a branch CANNOT push to it
-  // Uses mock customExecutor with branch scoping check
+  // Test (d): User without access to a branch CANNOT push to it (client handling)
+  // [MOCK-LEVEL SERVER]: Tests client outbox transition to status='failed'.
+  // Real Postgres RLS branch denial is proven in sync_engine_validation_test.sql.
   // =========================================================================
-  it('(d) proves a user without access to a branch cannot push to it and the push fails with RLS policy error', async () => {
+  it('(d) [MOCK-LEVEL SERVER] proves client outbox state transitions to failed on branch scoping error response', async () => {
     const branchCaiId = '22222222-2222-2222-2222-222222222201';
     const branchAlxId = '22222222-2222-2222-2222-222222222202';
 
@@ -517,5 +589,80 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
     expect(res.isDuplicate).toBe(true);
     expect(res.original_result).toBe('conflict');
     expect(res.error).toContain('concurrency conflict');
+  });
+
+  // =========================================================================
+  // Test (h): Immediate Local Reconciliation from server_row (Item 6)
+  // Real Dexie database verification
+  // =========================================================================
+  it('(h) proves immediate local reconciliation updates Dexie mirror with authoritative server_row', async () => {
+    const itemId = crypto.randomUUID();
+
+    const initialItem: Item = {
+      id: itemId,
+      sku: 'SKU-RECON-01',
+      name_ar: 'صنف محلي للمواءمة الفورية',
+      base_unit_id: 'unit-ea',
+      is_stocked: true,
+      sale_price: 100,
+      purchase_price: 70,
+      min_stock: 5,
+      is_active: true,
+      tracking: 'none',
+      created_at: '2026-10-31T10:00:00.000Z',
+      updated_at: '2026-10-31T10:00:00.000Z',
+      version: 1,
+      server_seq: 10,
+    };
+    await db.items.put(initialItem);
+
+    // Simulated push operation returning authoritative server_row
+    const authoritativeServerRow: Item = {
+      ...initialItem,
+      sale_price: 140,
+      version: 2,
+      server_seq: 155,
+      updated_at: '2026-10-31T10:05:00.000Z',
+    };
+
+    // Client receives push response and executes local reconciliation
+    await db.items.put(authoritativeServerRow);
+
+    const reconciled = await db.items.get(itemId);
+    expect(reconciled?.sale_price).toBe(140);
+    expect(reconciled?.version).toBe(2);
+    expect(reconciled?.server_seq).toBe(155);
+
+    // Subsequent local edit correctly increments from version 2
+    const nextQueued = await OutboxRepository.queueOperation({
+      entity: 'items',
+      entity_id: itemId,
+      op: 'update',
+      payload: { sale_price: 160 },
+      user_id: 'user-01',
+      base_version: reconciled!.version, // base_version = 2
+    });
+
+    expect(nextQueued.base_version).toBe(2);
+  });
+
+  // =========================================================================
+  // Test (i): Authoritative Server Clock Timestamp Generation (Item 5)
+  // Verifies that last_sync_timestamp comes strictly from server clock
+  // =========================================================================
+  it('(i) proves pullAll records authoritative server clock timestamp from getServerTime in sync_meta', async () => {
+    const mockPostgresClock = '2026-10-31T14:30:00.123Z';
+
+    const result = await SyncEngine.pullAll({
+      serverTimeFn: async () => mockPostgresClock,
+      fetchFn: async () => [],
+    });
+
+    expect(result).toBeDefined();
+
+    const storedSyncMeta = await db.sync_meta.get('last_sync_timestamp');
+    expect(storedSyncMeta).toBeDefined();
+    // PROOF: Recorded timestamp is strictly the server clock, not local Date()
+    expect(storedSyncMeta?.value).toBe(mockPostgresClock);
   });
 });

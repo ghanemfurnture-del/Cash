@@ -49,10 +49,12 @@ DECLARE
   v_op_id_9 uuid := '44444444-4444-4444-4444-444444444409';
   v_op_id_rev uuid := '44444444-4444-4444-4444-444444444410';
   v_op_id_transient uuid := '44444444-4444-4444-4444-444444444411';
+  v_idemp_item_id uuid := '55555555-5555-5555-5555-555555555501';
 
   v_res jsonb;
   v_res_dup jsonb;
   v_count int;
+  v_count_ops int;
   v_item_rec record;
   v_sync_op_rec record;
   v_old_version int;
@@ -147,11 +149,14 @@ BEGIN
   end if;
 
   -- -------------------------------------------------------------------
-  -- TEST 2: Non-Silent RLS Denial (0 rows affected reported as rejected)
+  -- TEST 2: Real Postgres RLS Branch Denial (Item 3.ii)
+  -- Proves user without branch access CANNOT write (UPDATE or INSERT)
+  -- to that branch under real Postgres RLS policies
   -- -------------------------------------------------------------------
   execute 'set local role authenticated';
   perform set_config('request.jwt.claims', json_build_object('sub', v_accountant_cai_uid, 'role', 'authenticated')::text, true);
 
+  -- 2a. Cross-branch UPDATE attempt on Alexandria journal entry
   select sync_push_op(
     v_op_id_1,
     'journal_entries',
@@ -162,13 +167,30 @@ BEGIN
     now()
   ) into v_res;
 
-  if (v_res ->> 'success')::boolean = false
-     and (v_res ->> 'status') = 'rejected'
-     and (v_res ->> 'code') = 'denied_or_not_found' then
-    insert into test_results values (2, 'Non-Silent RLS Denial Detection', 'PASS', 'Cross-branch update affecting 0 rows reported as rejected with code denied_or_not_found');
-  else
-    insert into test_results values (2, 'Non-Silent RLS Denial Detection', 'FAIL', 'Expected rejection with code denied_or_not_found, received: ' || v_res::text);
-  end if;
+  -- 2b. Cross-branch INSERT attempt into Alexandria branch
+  declare
+    v_res_ins jsonb;
+  begin
+    select sync_push_op(
+      gen_random_uuid(),
+      'journal_entries',
+      gen_random_uuid(),
+      'insert',
+      jsonb_build_object('branch_id', v_branch_alx, 'entry_no', 'JE-CROSS-ILLEGAL', 'series_code', 'S1', 'seq_no', 999888),
+      null,
+      now()
+    ) into v_res_ins;
+
+    if (v_res ->> 'success')::boolean = false
+       and (v_res ->> 'status') = 'rejected'
+       and (v_res ->> 'code') = 'denied_or_not_found'
+       and (v_res_ins ->> 'success')::boolean = false
+       and (v_res_ins ->> 'status') = 'rejected' then
+      insert into test_results values (2, 'Real RLS Branch Scoping Denial (Insert + Update)', 'PASS', 'Both cross-branch UPDATE (0 rows) and cross-branch INSERT were denied by RLS and reported as rejected');
+    else
+      insert into test_results values (2, 'Real RLS Branch Scoping Denial (Insert + Update)', 'FAIL', 'RLS branch denial failed: Update=' || v_res::text || ' Insert=' || v_res_ins::text);
+    end if;
+  end;
 
   -- -------------------------------------------------------------------
   -- TEST 3: Entity allowlist & Pull-Only rejection
@@ -377,37 +399,45 @@ BEGIN
   end if;
 
   -- -------------------------------------------------------------------
-  -- TEST 11: Idempotency (Duplicate push returns original_result applied)
+  -- TEST 11: Real Postgres Idempotency (Item 3.i)
+  -- Proves executing same op_id twice on real Postgres produces exactly ONE effect:
+  -- Exactly 1 row created in items, exactly 1 row in sync_ops, retry returns duplicate/applied
   -- -------------------------------------------------------------------
   -- First push
   select sync_push_op(
     v_op_id_9,
     'items',
-    gen_random_uuid(),
+    v_idemp_item_id,
     'insert',
     jsonb_build_object('sku', 'SKU-IDEMP-REV', 'name_ar', 'صنف فحص الحيادية', 'base_unit_id', (select id from units limit 1)),
     null,
     now()
   ) into v_res;
 
-  -- Second push (duplicate retry)
+  -- Second push (duplicate retry with exact same op_id)
   select sync_push_op(
     v_op_id_9,
     'items',
-    gen_random_uuid(),
+    v_idemp_item_id,
     'insert',
     jsonb_build_object('sku', 'SKU-IDEMP-REV', 'name_ar', 'صنف فحص الحيادية', 'base_unit_id', (select id from units limit 1)),
     null,
     now()
   ) into v_res_dup;
 
+  -- Count rows in business table and sync_ops
+  select count(*) into v_count from items where id = v_idemp_item_id;
+  select count(*) into v_count_ops from sync_ops where op_id = v_op_id_9;
+
   if (v_res ->> 'success')::boolean = true
      and (v_res_dup ->> 'status') = 'duplicate'
      and (v_res_dup ->> 'is_duplicate')::boolean = true
-     and (v_res_dup ->> 'original_result') = 'applied' then
-    insert into test_results values (11, 'Push Idempotency (Duplicate with original_result)', 'PASS', 'Retry returned status=duplicate, is_duplicate=true, original_result=applied');
+     and (v_res_dup ->> 'original_result') = 'applied'
+     and v_count = 1
+     and v_count_ops = 1 then
+    insert into test_results values (11, 'Real Postgres Idempotency (Same op_id = One Effect)', 'PASS', 'First push applied; duplicate retry returned original_result=applied; exactly 1 business row and 1 sync_ops row exist');
   else
-    insert into test_results values (11, 'Push Idempotency (Duplicate with original_result)', 'FAIL', 'Duplicate check failed: ' || v_res_dup::text);
+    insert into test_results values (11, 'Real Postgres Idempotency (Same op_id = One Effect)', 'FAIL', 'Idempotency failure: Dup=' || v_res_dup::text || ' items=' || v_count || ' sync_ops=' || v_count_ops);
   end if;
 
   -- -------------------------------------------------------------------

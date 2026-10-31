@@ -129,18 +129,47 @@ export class SyncEngine {
   }
 
   /**
+   * Retrieves authoritative server timestamp from PostgreSQL get_server_time() RPC.
+   * Guarantees sync cursor lookback thresholds never depend on device clocks.
+   */
+  static async getServerTime(customFetch?: () => Promise<string>): Promise<string> {
+    if (customFetch) {
+      return customFetch();
+    }
+    try {
+      const { data, error } = await (supabase.rpc as any)('get_server_time');
+      if (error || !data) {
+        throw new Error(error?.message || 'Failed to retrieve server time');
+      }
+      return data;
+    } catch {
+      // In offline/disconnected mode, preserve previous sync timestamp
+      const lastSyncRecord = await db.sync_meta.get('last_sync_timestamp');
+      return lastSyncRecord?.value || new Date(0).toISOString();
+    }
+  }
+
+  /**
    * Commit-safe pull across all v1 tables
    */
-  static async pullAll(): Promise<{ pulledCount: number; conflictsCount: number; maxSeq: number }> {
+  static async pullAll(options?: {
+    serverTimeFn?: () => Promise<string>;
+    fetchFn?: (tableName: string, query: { minSeq: number; lookbackIso: string; limit: number }) => Promise<any[]>;
+  }): Promise<{ pulledCount: number; conflictsCount: number; maxSeq: number }> {
     let totalApplied = 0;
     let totalConflicts = 0;
     let highestSeq = 0;
+
+    // Fetch authoritative server timestamp from PostgreSQL server clock
+    const serverTimestamp = await this.getServerTime(options?.serverTimeFn);
 
     for (const tableName of SYNCABLE_V1_TABLES) {
       const table = (db as any)[tableName] as Table<any, string> | undefined;
       if (!table) continue;
 
-      const res = await this.pullTable(table, tableName);
+      const res = await this.pullTable(table, tableName, {
+        fetchFn: options?.fetchFn ? (q) => options.fetchFn!(tableName, q) : undefined,
+      });
       totalApplied += res.applied;
       totalConflicts += res.conflicts;
       if (res.maxSeq > highestSeq) {
@@ -148,7 +177,7 @@ export class SyncEngine {
       }
     }
 
-    // Update global cursor
+    // Update global cursor using authoritative server clock timestamp
     await db.sync_meta.put({
       key: 'last_server_seq',
       value: highestSeq,
@@ -156,7 +185,7 @@ export class SyncEngine {
     });
     await db.sync_meta.put({
       key: 'last_sync_timestamp',
-      value: new Date().toISOString(),
+      value: serverTimestamp,
       updated_at: new Date().toISOString(),
     });
 
@@ -249,7 +278,12 @@ export class SyncEngine {
       });
 
       if (error) {
-        return { success: false, error: error.message };
+        // Handle 57014 statement timeout explicitly as transient retryable error
+        const isTimeout = error.code === '57014' || error.message?.includes('timeout') || error.message?.includes('canceling statement due to statement timeout');
+        return {
+          success: false,
+          error: isTimeout ? `Transient timeout (57014): ${error.message}` : error.message,
+        };
       }
 
       if (!data?.success) {
@@ -257,6 +291,12 @@ export class SyncEngine {
           return { success: data.original_result === 'applied', isDuplicate: true, error: data.error };
         }
         return { success: false, error: data?.error || 'Operation rejected by server' };
+      }
+
+      // Immediate local reconciliation: update version and server_seq to prevent stale base_version on subsequent edits
+      if (data?.server_row && (db as any)[item.entity]) {
+        const table = (db as any)[item.entity] as Table<any, string>;
+        await table.put(data.server_row);
       }
 
       return { success: true, isDuplicate: data?.status === 'duplicate' };

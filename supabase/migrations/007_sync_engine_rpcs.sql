@@ -1,5 +1,5 @@
 -- =====================================================================
--- 007_sync_engine.sql
+-- 007_sync_engine_rpcs.sql
 -- Phase 2b-2: Authoritative Single-Transaction Sync Engine RPCs
 -- 1. Private internal schema 'private' with no PostgREST exposure
 -- 2. Atomic Idempotent Claim & Bookkeeping for sync_ops (no p_user_id, uses auth.uid())
