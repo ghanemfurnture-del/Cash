@@ -83,11 +83,11 @@ describe('Commit-Safe Sync Cursor Engine (Simulation of Out-of-Order Commits)', 
     // 2. Simulated Server-Side Commit-Safe Pull with Time-Based Lookback Window:
     // A naive query "WHERE server_seq > 105" would MISS item B (100 <= 105)!
     // But our commit-safe pull queries:
-    // "WHERE server_seq > :cursor OR updated_at >= :last_sync - INTERVAL '15m'"
+    // "WHERE server_seq > :cursor OR updated_at >= :last_sync - INTERVAL '120 seconds'"
     // -------------------------------------------------------------------------
     const clientLastSeq = (await db.sync_meta.get('last_server_seq'))?.value || 0;
     const clientLastSyncTs = new Date('2026-10-31T10:00:01.000Z').getTime();
-    const lookbackThreshold = clientLastSyncTs - 15 * 60 * 1000; // 15 minutes before last sync
+    const lookbackThreshold = clientLastSyncTs - 120 * 1000; // 120 seconds (2 minutes) enforced pull window
 
     // Simulated server database holding both items:
     const serverDatabase = [itemA, itemB];
