@@ -102,3 +102,4 @@ describe('Authentication & Profile Authorization (003 RLS Contract)', () => {
     expect(branches[0].code).toBe('CAI');
   });
 });
+

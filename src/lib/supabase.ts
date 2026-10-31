@@ -13,3 +13,4 @@ export const supabase: SupabaseClient = createClient(supabaseUrl, supabaseAnonKe
     detectSessionInUrl: true,
   },
 });
+

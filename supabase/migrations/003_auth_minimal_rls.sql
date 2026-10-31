@@ -6,11 +6,17 @@
 
 -- Helper: Security Definer function to check if the caller is an Admin
 -- Avoids infinite recursion when evaluating profiles RLS policies
+-- DEPENDENCY DOCUMENTATION:
+-- Matches r.name = 'Admin' (consistent with user_has_branch in 002) OR well-known system Admin UUID.
+-- WARNING: Do not rename the 'Admin' role in database without updating is_admin() and user_has_branch().
 create or replace function is_admin() returns boolean
 language sql stable security definer set search_path = public as $$
   select exists (
     select 1 from profiles p join roles r on r.id = p.role_id
-    where p.id = auth.uid() and r.name = 'Admin' and p.is_active and p.deleted_at is null
+    where p.id = auth.uid()
+      and (r.name = 'Admin' or r.id = '00000000-0000-0000-0000-000000000001'::uuid)
+      and p.is_active
+      and p.deleted_at is null
   );
 $$;
 

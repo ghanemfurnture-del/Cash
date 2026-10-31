@@ -26,7 +26,7 @@ export const LoginPage: React.FC<{ onLoginSuccess?: () => void }> = ({ onLoginSu
       await login(email, password);
       if (onLoginSuccess) onLoginSuccess();
     } catch (err: any) {
-      setError(err?.message || 'تعذر تسجيل الدخول. يرجى التحقق من بيانات الدخول.');
+      setError(err?.message || 'تعذر تسجيل الدخول. يرجى التحقق من اتصالك وبياناتك.');
     } finally {
       setLoading(false);
     }
@@ -41,20 +41,13 @@ export const LoginPage: React.FC<{ onLoginSuccess?: () => void }> = ({ onLoginSu
             خ
           </div>
           <h1 className="text-xl font-bold text-foreground">نظام الخزينة والمحاسبة</h1>
-          <p className="text-xs text-muted-foreground">تسجيل الدخول الموحد (Supabase Auth & Offline Cache)</p>
+          <p className="text-xs text-muted-foreground">تسجيل الدخول الموحد (Supabase Auth)</p>
           {IS_DEV_MOCK_AUTH_ENABLED && (
             <span className="inline-block px-2 py-0.5 text-[10px] bg-amber-500/10 text-amber-600 rounded-full font-bold">
               وضع التطوير التجريبي مفعّل (Dev Mock Auth Active)
             </span>
           )}
         </div>
-
-        {error && (
-          <div className="p-3 text-xs rounded-xl bg-destructive/10 text-destructive border border-destructive/20 flex items-start gap-2">
-            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-            <span className="font-medium">{error}</span>
-          </div>
-        )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div className="space-y-1.5">
@@ -67,7 +60,10 @@ export const LoginPage: React.FC<{ onLoginSuccess?: () => void }> = ({ onLoginSu
               required
               autoComplete="email"
               value={email}
-              onChange={(e) => setEmail(e.target.value)}
+              onChange={(e) => {
+                setEmail(e.target.value);
+                if (error) setError(null);
+              }}
               className="w-full px-3 py-2 text-xs rounded-xl border border-input bg-background text-foreground focus:outline-hidden focus:ring-2 focus:ring-primary/20 transition-all placeholder:text-muted-foreground"
               placeholder="user@company.com"
             />
@@ -83,7 +79,10 @@ export const LoginPage: React.FC<{ onLoginSuccess?: () => void }> = ({ onLoginSu
               required
               autoComplete="current-password"
               value={password}
-              onChange={(e) => setPassword(e.target.value)}
+              onChange={(e) => {
+                setPassword(e.target.value);
+                if (error) setError(null);
+              }}
               className="w-full px-3 py-2 text-xs rounded-xl border border-input bg-background text-foreground focus:outline-hidden focus:ring-2 focus:ring-primary/20 transition-all placeholder:text-muted-foreground"
               placeholder="••••••••"
             />
@@ -92,11 +91,22 @@ export const LoginPage: React.FC<{ onLoginSuccess?: () => void }> = ({ onLoginSu
           <button
             type="submit"
             disabled={loading}
-            className="w-full py-2.5 px-4 text-xs font-bold rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 transition-colors flex items-center justify-center gap-2 shadow-xs disabled:opacity-50"
+            className="w-full py-2.5 px-4 text-xs font-bold rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 transition-colors flex items-center justify-center gap-2 shadow-xs disabled:opacity-50 cursor-pointer"
           >
             <span>{loading ? 'جارِ التحقق...' : t('auth.login')}</span>
             <ArrowRight className="w-4 h-4 rtl:rotate-180" />
           </button>
+
+          {/* Clear Arabic Error Message Rendered Directly Under The Submit Button */}
+          {error && (
+            <div
+              role="alert"
+              className="p-3 text-xs rounded-xl bg-destructive/10 text-destructive border border-destructive/20 flex items-start gap-2 animate-in fade-in slide-in-from-top-1 duration-200"
+            >
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span className="font-semibold leading-relaxed">{error}</span>
+            </div>
+          )}
         </form>
 
         <div className="flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground pt-2 border-t border-border/70">

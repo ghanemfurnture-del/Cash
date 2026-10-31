@@ -1,7 +1,7 @@
 import React from 'react';
 import { NavLink } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { LayoutDashboard, ShoppingCart, Receipt, Boxes, Landmark, Menu } from 'lucide-react';
+import { LayoutDashboard, ShoppingCart, Boxes, Landmark, Users2, Menu } from 'lucide-react';
 import { cn } from '../../lib/utils';
 
 export const MobileNav: React.FC<{ onOpenMore?: () => void }> = ({ onOpenMore }) => {
@@ -10,9 +10,9 @@ export const MobileNav: React.FC<{ onOpenMore?: () => void }> = ({ onOpenMore })
   const navItems = [
     { to: '/', labelKey: 'nav.dashboard', icon: LayoutDashboard },
     { to: '/sales', labelKey: 'nav.sales', icon: ShoppingCart },
-    { to: '/pos', labelKey: 'nav.pos', icon: Receipt },
     { to: '/inventory', labelKey: 'nav.inventory', icon: Boxes },
     { to: '/treasury', labelKey: 'nav.treasury', icon: Landmark },
+    { to: '/parties', labelKey: 'nav.parties', icon: Users2 },
   ];
 
   return (
@@ -41,7 +41,7 @@ export const MobileNav: React.FC<{ onOpenMore?: () => void }> = ({ onOpenMore })
       {/* More / Menu Drawer trigger */}
       <button
         onClick={onOpenMore}
-        className="flex flex-col items-center justify-center flex-1 h-full min-h-[44px] min-w-[44px] gap-1 text-[10px] font-medium text-muted-foreground hover:text-foreground transition-colors select-none"
+        className="flex flex-col items-center justify-center flex-1 h-full min-h-[44px] min-w-[44px] gap-1 text-[10px] font-medium text-muted-foreground hover:text-foreground transition-colors select-none cursor-pointer"
         aria-label="المزيد من القوائم"
       >
         <Menu className="w-5 h-5" />
@@ -50,4 +50,3 @@ export const MobileNav: React.FC<{ onOpenMore?: () => void }> = ({ onOpenMore })
     </nav>
   );
 };
-

@@ -26,6 +26,7 @@ interface NavItem {
   labelKey: string;
   icon: React.ComponentType<{ className?: string }>;
   module: string;
+  comingSoon?: boolean;
 }
 
 const navSections: { titleKey?: string; items: NavItem[] }[] = [
@@ -35,29 +36,29 @@ const navSections: { titleKey?: string; items: NavItem[] }[] = [
     ],
   },
   {
-    titleKey: 'العمليات التجارية واليومية',
+    titleKey: 'العمليات التجارية واليومية (v1)',
     items: [
       { to: '/sales', labelKey: 'nav.sales', icon: ShoppingCart, module: 'sales' },
-      { to: '/pos', labelKey: 'nav.pos', icon: Receipt, module: 'pos' },
       { to: '/purchases', labelKey: 'nav.purchases', icon: ShoppingBag, module: 'purchases' },
       { to: '/inventory', labelKey: 'nav.inventory', icon: Boxes, module: 'inventory' },
       { to: '/treasury', labelKey: 'nav.treasury', icon: Landmark, module: 'treasury' },
+      { to: '/parties', labelKey: 'nav.parties', icon: Users2, module: 'parties' },
+      { to: '/pos', labelKey: 'nav.pos', icon: Receipt, module: 'pos', comingSoon: true },
     ],
   },
   {
-    titleKey: 'الأطراف والمحاسبة',
+    titleKey: 'المحاسبة والتقارير',
     items: [
-      { to: '/parties', labelKey: 'nav.parties', icon: Users2, module: 'parties' },
       { to: '/accounting', labelKey: 'nav.accounting', icon: Scale, module: 'accounting' },
       { to: '/reports', labelKey: 'nav.reports', icon: FileSpreadsheet, module: 'reports' },
     ],
   },
   {
-    titleKey: 'الموارد والأصول والضبط',
+    titleKey: 'الموديلات المستقبلية والضبط',
     items: [
-      { to: '/hr', labelKey: 'nav.hr', icon: Users, module: 'hr' },
-      { to: '/fixed-assets', labelKey: 'nav.fixed_assets', icon: Briefcase, module: 'fixed_assets' },
-      { to: '/budgets', labelKey: 'nav.budgets', icon: PieChart, module: 'budgets' },
+      { to: '/hr', labelKey: 'nav.hr', icon: Users, module: 'hr', comingSoon: true },
+      { to: '/fixed-assets', labelKey: 'nav.fixed_assets', icon: Briefcase, module: 'fixed_assets', comingSoon: true },
+      { to: '/budgets', labelKey: 'nav.budgets', icon: PieChart, module: 'budgets', comingSoon: true },
       { to: '/audit', labelKey: 'nav.audit', icon: ShieldAlert, module: 'audit' },
       { to: '/backup', labelKey: 'nav.backup', icon: DatabaseBackup, module: 'backup' },
       { to: '/settings', labelKey: 'nav.settings', icon: Settings, module: 'settings' },
@@ -85,7 +86,6 @@ export const Sidebar: React.FC = () => {
       {/* Nav List */}
       <div className="flex-1 overflow-y-auto px-3 py-3 space-y-4">
         {navSections.map((section, idx) => {
-          // Filter items based on permissions
           const visibleItems = section.items.filter((item) => hasPermission(item.module, 'view'));
           if (visibleItems.length === 0) return null;
 
@@ -98,6 +98,26 @@ export const Sidebar: React.FC = () => {
               )}
               {visibleItems.map((item) => {
                 const Icon = item.icon;
+
+                // Modules outside v1 are visibly marked "coming soon" and do NOT open working screens
+                if (item.comingSoon) {
+                  return (
+                    <div
+                      key={item.to}
+                      className="flex items-center justify-between px-3 py-2 rounded-xl text-xs font-medium text-muted-foreground/60 cursor-not-allowed select-none bg-muted/20"
+                      title="الموديول قيد التطوير في مراحل لاحقة"
+                    >
+                      <div className="flex items-center gap-3">
+                        <Icon className="w-4 h-4 shrink-0 text-muted-foreground/40" />
+                        <span className="truncate">{t(item.labelKey)}</span>
+                      </div>
+                      <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+                        قريباً
+                      </span>
+                    </div>
+                  );
+                }
+
                 return (
                   <NavLink
                     key={item.to}
@@ -123,4 +143,3 @@ export const Sidebar: React.FC = () => {
     </aside>
   );
 };
-

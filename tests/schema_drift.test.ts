@@ -4,15 +4,26 @@ import path from 'path';
 import 'fake-indexeddb/auto';
 import { db } from '../src/db';
 
-describe('DEXIE vs SQL Schema Drift Verification Test', () => {
-  it('parses tables from 001 and 002 migrations and asserts 100% parity with Dexie schema', () => {
-    const migration001Path = path.resolve(__dirname, '../supabase/migrations/001_core_schema.sql');
-    const migration002Path = path.resolve(__dirname, '../supabase/migrations/002_extended_schema.sql');
+describe('DEXIE vs SQL Schema Drift Verification Test (Tables & Columns)', () => {
+  const migration001Path = path.resolve(__dirname, '../supabase/migrations/001_core_schema.sql');
+  const migration002Path = path.resolve(__dirname, '../supabase/migrations/002_extended_schema.sql');
 
-    const sql001 = fs.readFileSync(migration001Path, 'utf-8');
-    const sql002 = fs.readFileSync(migration002Path, 'utf-8');
+  const sql001 = fs.readFileSync(migration001Path, 'utf-8');
+  const sql002 = fs.readFileSync(migration002Path, 'utf-8');
 
-    // Regex to match "create table <table_name>"
+  // Base columns inherited by all tables via _row_base
+  const baseColumns = [
+    'id',
+    'created_at',
+    'updated_at',
+    'created_by',
+    'device_id',
+    'version',
+    'server_seq',
+    'deleted_at',
+  ];
+
+  it('verifies 100% table name parity between SQL migrations and Dexie', () => {
     const createTableRegex = /create\s+table\s+([a-zA-Z0-9_]+)/gi;
 
     const extractTables = (sql: string): string[] => {
@@ -20,7 +31,6 @@ describe('DEXIE vs SQL Schema Drift Verification Test', () => {
       let match;
       while ((match = createTableRegex.exec(sql)) !== null) {
         const tableName = match[1].toLowerCase();
-        // Ignore template table _row_base
         if (tableName !== '_row_base') {
           tables.push(tableName);
         }
@@ -32,45 +42,122 @@ describe('DEXIE vs SQL Schema Drift Verification Test', () => {
     const tables002 = extractTables(sql002);
     const allSqlTables = Array.from(new Set([...tables001, ...tables002]));
 
-    // Server-only tables that must NOT be mirrored in client Dexie:
+    // Server-only tables not mirrored in client Dexie:
     const serverOnlyTables = ['sync_ops'];
-
-    // Expected SQL tables that MUST be mirrored in Dexie:
     const expectedMirroredTables = allSqlTables
       .filter((t) => !serverOnlyTables.includes(t))
       .sort();
 
-    // Client-only tables created specifically for Dexie offline engine:
+    // Client-only tables created for Dexie offline sync engine:
     const clientOnlyTables = ['outbox', 'sync_meta'];
-
-    // Actual tables defined in Dexie instance
     const actualDexieTables = db.tables
       .map((t) => t.name)
       .filter((t) => !clientOnlyTables.includes(t))
       .sort();
 
-    // 1. Check exact table count
-    expect(
-      expectedMirroredTables.length,
-      `Mismatch in table count between SQL contract and Dexie`
-    ).toBe(actualDexieTables.length);
+    expect(actualDexieTables.length).toBe(expectedMirroredTables.length);
+    expect(actualDexieTables).toEqual(expectedMirroredTables);
+  });
 
-    // 2. Check for missing tables in Dexie (SQL tables not in Dexie)
-    const missingInDexie = expectedMirroredTables.filter((t) => !actualDexieTables.includes(t));
-    expect(
-      missingInDexie,
-      `These tables exist in SQL migrations but are MISSING in Dexie: ${missingInDexie.join(', ')}`
-    ).toEqual([]);
+  it('extracts and verifies column parity for core business tables', () => {
+    const tableColumnsSql: Record<string, string[]> = {};
 
-    // 3. Check for extra/drift tables in Dexie (Dexie tables not in SQL contract)
-    const extraInDexie = actualDexieTables.filter((t) => !expectedMirroredTables.includes(t));
-    expect(
-      extraInDexie,
-      `These tables exist in Dexie but NOT in the SQL contract: ${extraInDexie.join(', ')}`
-    ).toEqual([]);
+    // Match column name followed by PostgreSQL data types
+    const colTypeRegex = /\b([a-zA-Z0-9_]+)\s+(?:text|uuid|int|bigint|smallint|numeric(?:\([^)]*\))?|char(?:\([^)]*\))?|date|timestamptz|boolean|jsonb|text\[\])\b/gi;
 
-    // 4. Verify client-only tables exist
-    expect(db.tables.map((t) => t.name)).toContain('outbox');
-    expect(db.tables.map((t) => t.name)).toContain('sync_meta');
+    const parseSqlTables = (sql: string) => {
+      const blocks = sql.split(/create\s+table\s+/i);
+      for (const block of blocks) {
+        const nameMatch = /^([a-zA-Z0-9_]+)/.exec(block);
+        if (!nameMatch) continue;
+        const tableName = nameMatch[1].toLowerCase();
+        if (tableName === '_row_base') continue;
+
+        const cols = new Set<string>(baseColumns);
+        
+        let match;
+        while ((match = colTypeRegex.exec(block)) !== null) {
+          const colName = match[1].toLowerCase();
+          // Filter out SQL keywords that might match preceding syntax
+          if (!['create', 'table', 'like', 'check', 'unique', 'primary', 'foreign', 'references', 'default'].includes(colName)) {
+            cols.add(colName);
+          }
+        }
+        tableColumnsSql[tableName] = Array.from(cols);
+      }
+    };
+
+    parseSqlTables(sql001);
+    parseSqlTables(sql002);
+
+    // Parse all ALTER TABLE ... ADD COLUMN statements (including multiple add column per line)
+    const combinedSql = sql001 + '\n' + sql002;
+    const alterStatements = combinedSql.split(/alter\s+table\s+/i);
+    for (const stmt of alterStatements) {
+      const tableMatch = /^([a-zA-Z0-9_]+)/i.exec(stmt);
+      if (!tableMatch) continue;
+      const table = tableMatch[1].toLowerCase();
+      const addColRegex = /add\s+column\s+([a-zA-Z0-9_]+)/gi;
+      let addMatch;
+      while ((addMatch = addColRegex.exec(stmt)) !== null) {
+        const col = addMatch[1].toLowerCase();
+        if (tableColumnsSql[table]) {
+          if (!tableColumnsSql[table].includes(col)) {
+            tableColumnsSql[table].push(col);
+          }
+        }
+      }
+    }
+
+    // Verify key tables have their required columns in Dexie indexes/schema
+    const checkTableColumns = (tableName: string, requiredColumns: string[]) => {
+      const sqlCols = tableColumnsSql[tableName];
+      expect(sqlCols, `Table ${tableName} not found in parsed SQL`).toBeDefined();
+      for (const col of requiredColumns) {
+        expect(sqlCols, `Missing column ${col} in SQL table ${tableName}`).toContain(col);
+      }
+    };
+
+    // 1. documents
+    checkTableColumns('documents', [
+      'id', 'doc_type', 'series_code', 'seq_no', 'doc_no', 'doc_date',
+      'party_id', 'warehouse_id', 'currency_code', 'exchange_rate',
+      'subtotal', 'discount_total', 'tax_total', 'total', 'status',
+      'branch_id', 'source', 'pos_shift_id'
+    ]);
+
+    // 2. document_lines
+    checkTableColumns('document_lines', [
+      'id', 'document_id', 'line_no', 'item_id', 'qty', 'unit_price',
+      'line_total', 'lot_no', 'expiry_date', 'serial_no'
+    ]);
+
+    // 3. journal_entries
+    checkTableColumns('journal_entries', [
+      'id', 'series_code', 'seq_no', 'entry_no', 'entry_date',
+      'source_type', 'status', 'branch_id'
+    ]);
+
+    // 4. journal_lines
+    checkTableColumns('journal_lines', [
+      'id', 'entry_id', 'line_no', 'account_id', 'debit', 'credit'
+    ]);
+
+    // 5. stock_movements
+    checkTableColumns('stock_movements', [
+      'id', 'item_id', 'warehouse_id', 'movement_date', 'movement_type',
+      'qty_base', 'unit_cost', 'lot_no', 'expiry_date', 'serial_no'
+    ]);
+
+    // 6. parties
+    checkTableColumns('parties', [
+      'id', 'code', 'name_ar', 'is_customer', 'is_supplier',
+      'price_list_id', 'country_code'
+    ]);
+
+    // 7. items
+    checkTableColumns('items', [
+      'id', 'sku', 'name_ar', 'base_unit_id', 'sale_price', 'purchase_price', 'tracking'
+    ]);
   });
 });

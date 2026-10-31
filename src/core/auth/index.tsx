@@ -254,7 +254,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
 
       if (authError || !authData.user) {
-        throw new Error(authError?.message || 'بيانات الدخول غير صحيحة (Invalid email or password).');
+        const msg = authError?.message || '';
+        if (msg.toLowerCase().includes('invalid login credentials') || msg.toLowerCase().includes('invalid grant')) {
+          throw new Error('بيانات الدخول غير صحيحة. يرجى التأكد من البريد الإلكتروني وكلمة المرور.');
+        } else if (msg.toLowerCase().includes('email not confirmed')) {
+          throw new Error('البريد الإلكتروني لم يتم تأكيده بعد. يرجى تفعيل الحساب من رابط البريد.');
+        } else if (msg.toLowerCase().includes('failed to fetch') || msg.toLowerCase().includes('network')) {
+          throw new Error('تعذر الاتصال بخادم المصادقة. يرجى التحقق من اتصالك بالإنترنت.');
+        }
+        throw new Error(authError?.message || 'تعذر تسجيل الدخول بالبيانات المدخلة.');
       }
 
       // Load Profile & Roles under RLS policies

@@ -1,7 +1,6 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   TrendingUp,
-  Receipt,
   Boxes,
   Users,
   CreditCard,
@@ -11,9 +10,16 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../core/auth';
 import { formatMoney } from '../../core/decimal';
+import { db } from '../../db';
 
 export const DashboardPage: React.FC = () => {
   const { currentBranch, session } = useAuth();
+  const [activeTableCount, setActiveTableCount] = useState<number>(0);
+
+  useEffect(() => {
+    // Real runtime check of initialized Dexie tables
+    setActiveTableCount(db.tables.length);
+  }, []);
 
   return (
     <div className="space-y-6">
@@ -33,7 +39,7 @@ export const DashboardPage: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2">
-          <button className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 shadow-xs transition-colors">
+          <button className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 shadow-xs transition-colors cursor-pointer">
             <PlusCircle className="w-4 h-4" />
             <span>فاتورة مبيعات جديدة</span>
           </button>
@@ -102,13 +108,8 @@ export const DashboardPage: React.FC = () => {
       {/* Offline Status & Quick Actions */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <div className="lg:col-span-2 p-5 rounded-2xl bg-card border border-border shadow-xs space-y-4">
-          <h3 className="font-bold text-sm text-foreground">الوصول السريع للعمليات</h3>
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            <div className="p-3.5 rounded-xl border border-border/80 hover:border-primary hover:bg-muted/40 transition-colors cursor-pointer space-y-1">
-              <Receipt className="w-5 h-5 text-primary" />
-              <p className="text-xs font-semibold text-foreground">نقطة البيع (POS)</p>
-              <p className="text-[10px] text-muted-foreground">إصدار إيصالات فورية أوفلاين</p>
-            </div>
+          <h3 className="font-bold text-sm text-foreground">الوصول السريع للعمليات الأساسية</h3>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div className="p-3.5 rounded-xl border border-border/80 hover:border-primary hover:bg-muted/40 transition-colors cursor-pointer space-y-1">
               <Boxes className="w-5 h-5 text-emerald-600" />
               <p className="text-xs font-semibold text-foreground">إدارة الأصناف</p>
@@ -116,8 +117,13 @@ export const DashboardPage: React.FC = () => {
             </div>
             <div className="p-3.5 rounded-xl border border-border/80 hover:border-primary hover:bg-muted/40 transition-colors cursor-pointer space-y-1">
               <CreditCard className="w-5 h-5 text-blue-600" />
-              <p className="text-xs font-semibold text-foreground">سندات القبض</p>
+              <p className="text-xs font-semibold text-foreground">سندات الخزينة</p>
               <p className="text-[10px] text-muted-foreground">تسجيل سداد نقدي أو بنكي</p>
+            </div>
+            <div className="p-3.5 rounded-xl border border-border/80 hover:border-primary hover:bg-muted/40 transition-colors cursor-pointer space-y-1">
+              <Users className="w-5 h-5 text-primary" />
+              <p className="text-xs font-semibold text-foreground">دليل الأطراف</p>
+              <p className="text-[10px] text-muted-foreground">إدارة العملاء والموردين</p>
             </div>
           </div>
         </div>
@@ -129,11 +135,13 @@ export const DashboardPage: React.FC = () => {
             <h3 className="font-bold text-sm text-foreground">محرك العمل غير المتصل (IndexedDB)</h3>
           </div>
           <p className="text-xs text-muted-foreground leading-relaxed">
-            النظام يعمل بكامل كفاءته من الذاكرة المحلية لجهازك. يتم حفظ كافة الفواتير والقيود فورياً ومزامنتها تلقائياً مع السحابة عند توفر اتصال.
+            يعمل النظام محلياً عبر قاعدة بيانات IndexedDB بالمتصفح، مع جاهزية كاملة لحفظ الفواتير والقيود محلياً.
           </p>
           <div className="pt-2 border-t border-border/60 flex items-center justify-between text-xs">
-            <span className="text-muted-foreground">الجداول المحلية النشطة:</span>
-            <span className="font-bold text-primary">66 جدولاً متطابقاً</span>
+            <span className="text-muted-foreground">الجداول المحلية المهيأة:</span>
+            <span className="font-bold text-primary tabular-nums">
+              {activeTableCount > 0 ? `${activeTableCount} جدولاً نشطاً` : 'جارِ الفحص...'}
+            </span>
           </div>
         </div>
       </div>
