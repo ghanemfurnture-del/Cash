@@ -1,26 +1,36 @@
 -- =====================================================================
 -- 007_sync_engine.sql
 -- Phase 2b-2: Authoritative Single-Transaction Sync Engine RPCs
--- 1. Atomic Idempotent Claim & Bookkeeping for sync_ops
--- 2. sync_push_op: Single-entity mutation under caller JWT (SECURITY INVOKER)
---    - Entity allowlist enforcement
---    - Server-controlled column stripping (jsonb - array[...])
---    - Optimistic concurrency control (base_version matching)
---    - Non-silent RLS denial detection (checks row_count > 0)
---    - Soft delete enforcement (deleted_at = now())
--- 3. sync_push_document: Atomic Header + Lines + Posting bundle in ONE transaction
+-- 1. Private internal schema 'private' with no PostgREST exposure
+-- 2. Atomic Idempotent Claim & Bookkeeping for sync_ops (no p_user_id, uses auth.uid())
+-- 3. Per-table column allowlists & branch_id immutability on updates
+-- 4. Optimistic concurrency with SELECT FOR UPDATE and required base_version
+-- 5. Whitelist error classification: re-raises 40001, 55P03, 57xxx, 53xxx; records only 23xxx, 22xxx, 42501, P0001
+-- 6. Machine-readable error codes ('conflict', 'denied_or_not_found', 'constraint', 'validation') and server_row
+-- 7. Entity -> Allowed ops map (pull-only tables restricted)
+-- 8. sync_push_document: Atomic Header + Lines + Posting in ONE transaction
+-- 9. get_server_time(): Authoritative PostgreSQL server clock
 -- =====================================================================
 
 -- ---------------------------------------------------------------------
--- 1. INTERNAL ATOMIC BOOKKEEPING FUNCTIONS (SECURITY DEFINER)
+-- 1. PRIVATE SCHEMA FOR INTERNAL BOOKKEEPING (Shielded from PostgREST)
+-- ---------------------------------------------------------------------
+
+create schema if not exists private;
+revoke all on schema private from public, anon;
+grant usage on schema private to authenticated;
+
+-- ---------------------------------------------------------------------
+-- 2. INTERNAL ATOMIC BOOKKEEPING FUNCTIONS (In private schema)
 -- ---------------------------------------------------------------------
 
 -- A. Atomic Claim of op_id:
+-- Uses auth.uid() directly (no p_user_id parameter to prevent spoofing).
 -- Uses INSERT ... ON CONFLICT (op_id) DO NOTHING to eliminate race conditions.
--- Guarantees caller-scoped duplicate checking.
-create or replace function _internal_claim_sync_op(
+-- Valid result values in 001 check constraint: 'applied', 'duplicate', 'conflict', 'rejected'.
+-- During initial claim, result is NULL (unfinalized in this transaction).
+create or replace function private._internal_claim_sync_op(
   p_op_id uuid,
-  p_user_id uuid,
   p_entity text,
   p_entity_id uuid,
   p_op text,
@@ -36,22 +46,27 @@ returns table (
 )
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, private
 as $$
 declare
+  v_caller_uid uuid := auth.uid();
   v_rec record;
 begin
-  -- 1. Atomic insert attempt
+  if v_caller_uid is null then
+    raise exception 'Unauthorized: caller must be authenticated' using errcode = '42501';
+  end if;
+
+  -- 1. Atomic claim attempt (result is NULL initially)
   insert into sync_ops (
     op_id, user_id, entity, entity_id, op, payload,
     base_version, client_ts, schema_version, result, error
   ) values (
-    p_op_id, p_user_id, p_entity, p_entity_id, p_op, p_payload,
-    p_base_version, coalesce(p_client_ts, now()), 1, 'in_progress', null
+    p_op_id, v_caller_uid, p_entity, p_entity_id, p_op, p_payload,
+    p_base_version, coalesce(p_client_ts, now()), 1, null, null
   )
   on conflict (op_id) do nothing;
 
-  -- 2. Inspect the current record for this op_id
+  -- 2. Inspect record
   select user_id, result, error into v_rec
   from sync_ops
   where op_id = p_op_id;
@@ -60,14 +75,14 @@ begin
     raise exception 'Critical error: sync_ops record not found after claim';
   end if;
 
-  -- Check if owned by another user
-  if v_rec.user_id <> p_user_id then
-    return query select false, v_rec.result, 'Collision: op_id already claimed by another user'::text, true;
+  -- Check if owned by another user (caller-scoped duplicate check)
+  if v_rec.user_id <> v_caller_uid then
+    return query select false, v_rec.result, 'Operation ID collision: op_id belongs to another user'::text, true;
     return;
   end if;
 
-  -- If result is 'in_progress', this transaction claimed it!
-  if v_rec.result = 'in_progress' then
+  -- If result is NULL, this transaction claimed it!
+  if v_rec.result is null then
     return query select true, null::text, null::text, false;
   else
     -- Already completed in a prior transaction (applied or rejected)
@@ -77,7 +92,7 @@ end;
 $$;
 
 -- B. Finalize sync_op result within the same transaction
-create or replace function _internal_finalize_sync_op(
+create or replace function private._internal_finalize_sync_op(
   p_op_id uuid,
   p_result text,
   p_error text default null
@@ -85,7 +100,7 @@ create or replace function _internal_finalize_sync_op(
 returns void
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, private
 as $$
 begin
   update sync_ops
@@ -95,12 +110,25 @@ begin
 end;
 $$;
 
-revoke all on function _internal_claim_sync_op from public, anon;
-revoke all on function _internal_finalize_sync_op from public, anon;
+-- Strict revocations: Never callable via public schema or by anon/public
+revoke all on function private._internal_claim_sync_op from public, anon;
+revoke all on function private._internal_finalize_sync_op from public, anon;
+grant execute on function private._internal_claim_sync_op to authenticated;
+grant execute on function private._internal_finalize_sync_op to authenticated;
 
 -- ---------------------------------------------------------------------
--- 2. AUTHORITATIVE SINGLE-ENTITY SYNC PUSH RPC (SECURITY INVOKER)
--- Runs under the caller's JWT, strictly enforcing RLS and audit_row!
+-- 3. SERVER CLOCK RPC
+-- ---------------------------------------------------------------------
+
+create or replace function get_server_time() returns timestamptz
+language sql stable set search_path = public as $$
+  select clock_timestamp();
+$$;
+
+grant execute on function get_server_time() to authenticated;
+
+-- ---------------------------------------------------------------------
+-- 4. AUTHORITATIVE SINGLE-ENTITY SYNC PUSH RPC (SECURITY INVOKER)
 -- ---------------------------------------------------------------------
 
 create or replace function sync_push_op(
@@ -115,74 +143,164 @@ create or replace function sync_push_op(
 returns jsonb
 language plpgsql
 security invoker
-set search_path = public
+set search_path = public, private
 as $$
 declare
   v_caller_uid uuid := auth.uid();
   v_claim record;
-  v_allowed_entities text[] := array[
-    'documents', 'document_lines', 'journal_entries', 'journal_lines',
-    'payments', 'items', 'parties', 'accounts', 'cost_centers',
-    'tax_codes', 'units', 'currencies', 'warehouses', 'branches',
-    'fiscal_years', 'fiscal_periods'
-  ];
-  v_clean_payload jsonb;
+  v_allowed_cols text[];
+  v_clean_payload jsonb := '{}'::jsonb;
+  v_key text;
+  v_val text;
+  v_current_row record;
   v_rows_affected int := 0;
-  v_current_version int;
   v_col_list text;
   v_val_list text;
   v_set_clause text;
-  v_key text;
+  v_code text;
 begin
   -- 0. Authentication Check
   if v_caller_uid is null then
-    raise exception 'Unauthorized: caller must be authenticated';
+    raise exception 'Unauthorized: caller must be authenticated' using errcode = '42501';
   end if;
 
   -- 1. Operation Validation
-  if p_op not in ('insert', 'update', 'delete', 'post', 'reverse') then
-    return jsonb_build_object('success', false, 'status', 'rejected', 'error', 'Invalid operation: ' || coalesce(p_op, 'NULL'));
+  if p_op not in ('insert', 'update', 'delete', 'post') then
+    return jsonb_build_object(
+      'success', false,
+      'status', 'rejected',
+      'code', 'validation',
+      'error', 'Invalid operation: ' || coalesce(p_op, 'NULL')
+    );
   end if;
 
-  -- 2. Entity Allowlist Check
-  if not (p_entity = any(v_allowed_entities)) then
-    return jsonb_build_object('success', false, 'status', 'rejected', 'error', 'Entity not allowed for sync: ' || coalesce(p_entity, 'NULL'));
+  -- 2. Entity -> Allowed Operations Map & Pull-Only Restrictions
+  if p_entity in ('fiscal_years', 'fiscal_periods', 'branches', 'accounts', 'tax_codes', 'units', 'currencies', 'cost_centers', 'warehouses') then
+    return jsonb_build_object(
+      'success', false,
+      'status', 'rejected',
+      'code', 'validation',
+      'error', 'Entity ' || p_entity || ' is pull-only in v1'
+    );
+  elsif p_entity in ('documents', 'journal_entries', 'payments') then
+    if p_op not in ('insert', 'update', 'post') then
+      return jsonb_build_object(
+        'success', false,
+        'status', 'rejected',
+        'code', 'validation',
+        'error', 'Operation ' || p_op || ' is not allowed on ' || p_entity
+      );
+    end if;
+  elsif p_entity in ('document_lines', 'journal_lines') then
+    if p_op not in ('insert', 'update', 'delete') then
+      return jsonb_build_object(
+        'success', false,
+        'status', 'rejected',
+        'code', 'validation',
+        'error', 'Operation ' || p_op || ' is not allowed on ' || p_entity
+      );
+    end if;
+  elsif p_entity in ('items', 'parties') then
+    if p_op not in ('insert', 'update', 'delete') then
+      return jsonb_build_object(
+        'success', false,
+        'status', 'rejected',
+        'code', 'validation',
+        'error', 'Operation ' || p_op || ' is not allowed on ' || p_entity
+      );
+    end if;
+  else
+    return jsonb_build_object(
+      'success', false,
+      'status', 'rejected',
+      'code', 'validation',
+      'error', 'Entity not allowed for sync: ' || coalesce(p_entity, 'NULL')
+    );
   end if;
 
-  -- 3. Atomic Claim of op_id
-  select * into v_claim from _internal_claim_sync_op(
-    p_op_id, v_caller_uid, p_entity, p_entity_id, p_op, p_payload, p_base_version, p_client_ts
+  -- 3. Atomic Claim of op_id in private schema
+  select * into v_claim from private._internal_claim_sync_op(
+    p_op_id, p_entity, p_entity_id, p_op, p_payload, p_base_version, p_client_ts
   );
 
   if v_claim.is_other_user then
-    return jsonb_build_object('success', false, 'status', 'rejected', 'error', 'Operation ID collision: op_id belongs to another user');
+    return jsonb_build_object(
+      'success', false,
+      'status', 'rejected',
+      'code', 'validation',
+      'error', 'Operation ID collision: op_id belongs to another user'
+    );
   end if;
 
   if not v_claim.is_claimed then
-    -- Idempotent Duplicate: Return original outcome (applied or rejected)
+    -- Idempotent Duplicate
     return jsonb_build_object(
       'success', (v_claim.existing_result = 'applied'),
       'status', 'duplicate',
       'is_duplicate', true,
       'original_result', v_claim.existing_result,
+      'code', case when v_claim.existing_result = 'applied' then 'ok' else 'constraint' end,
       'error', v_claim.existing_error
     );
   end if;
 
-  -- 4. Column Control: Strip server-controlled columns from client payload
-  -- id, server_seq, version, created_at/by, updated_at/by, deleted_at, status, posted_at
-  v_clean_payload := p_payload - array[
-    'id', 'server_seq', 'version', 'created_at', 'created_by',
-    'updated_at', 'updated_by', 'deleted_at', 'status', 'posted_at'
-  ];
+  -- 4. Optimistic Concurrency Requirement:
+  -- base_version is strictly REQUIRED on financial documents and lines
+  if p_entity in ('documents', 'document_lines', 'journal_entries', 'journal_lines', 'payments')
+     and p_op in ('update', 'delete', 'post')
+     and p_base_version is null then
+    perform private._internal_finalize_sync_op(p_op_id, 'rejected', 'base_version is required for ' || p_op || ' on ' || p_entity);
+    return jsonb_build_object(
+      'success', false,
+      'status', 'rejected',
+      'code', 'validation',
+      'error', 'base_version is required for ' || p_op || ' on ' || p_entity
+    );
+  end if;
 
-  -- 5. Business Operation Execution with Savepoint for Permanent Error Logging
+  -- 5. Empty Payload Check on Update
+  if p_op = 'update' and (p_payload is null or p_payload = '{}'::jsonb) then
+    perform private._internal_finalize_sync_op(p_op_id, 'rejected', 'Payload cannot be empty for update');
+    return jsonb_build_object(
+      'success', false,
+      'status', 'rejected',
+      'code', 'validation',
+      'error', 'Payload cannot be empty for update'
+    );
+  end if;
+
+  -- 6. Per-Table Column Allowlists
+  if p_entity = 'items' then
+    v_allowed_cols := array['sku', 'barcode', 'name_ar', 'name_en', 'base_unit_id', 'category_id', 'is_stocked', 'sale_price', 'purchase_price', 'min_stock', 'tax_code_id', 'tracking', 'is_active'];
+  elsif p_entity = 'parties' then
+    v_allowed_cols := array['code', 'name_ar', 'name_en', 'kind', 'tax_id', 'commercial_reg', 'national_id', 'phone', 'email', 'address', 'credit_limit', 'payment_terms_days', 'is_active'];
+  elsif p_entity = 'documents' then
+    v_allowed_cols := array['doc_type', 'series_code', 'seq_no', 'doc_no', 'doc_date', 'due_date', 'party_id', 'warehouse_id', 'currency_code', 'exchange_rate', 'payment_method', 'subtotal', 'discount_total', 'tax_total', 'total', 'notes', 'branch_id', 'source', 'pos_shift_id'];
+  elsif p_entity = 'document_lines' then
+    v_allowed_cols := array['document_id', 'line_no', 'item_id', 'description', 'unit_id', 'qty', 'unit_factor', 'unit_price', 'discount_amount', 'tax_code_id', 'tax_rate', 'tax_amount', 'line_total', 'unit_cost', 'cost_center_id'];
+  elsif p_entity = 'journal_entries' then
+    v_allowed_cols := array['series_code', 'seq_no', 'entry_no', 'entry_date', 'description', 'source_type', 'source_id', 'branch_id'];
+  elsif p_entity = 'journal_lines' then
+    v_allowed_cols := array['entry_id', 'line_no', 'account_id', 'party_id', 'cost_center_id', 'debit', 'credit', 'currency_code', 'fx_amount', 'memo'];
+  elsif p_entity = 'payments' then
+    v_allowed_cols := array['payment_type', 'series_code', 'seq_no', 'voucher_no', 'voucher_date', 'party_id', 'treasury_account_id', 'currency_code', 'exchange_rate', 'amount', 'payment_method', 'reference_no', 'notes', 'branch_id'];
+  end if;
+
+  -- Build clean payload strictly from allowlist
+  if p_payload is not null then
+    for v_key in select * from jsonb_object_keys(p_payload) loop
+      if v_key = any(v_allowed_cols) then
+        v_clean_payload := v_clean_payload || jsonb_build_object(v_key, p_payload -> v_key);
+      end if;
+    end loop;
+  end if;
+
+  -- 7. Business Operation Execution
   begin
     -- -----------------------------------------------------------------
     -- A. INSERT
     -- -----------------------------------------------------------------
     if p_op = 'insert' then
-      -- Prepare columns and values dynamically
       select
         string_agg(quote_ident(key), ', '),
         string_agg(quote_nullable(value #>> '{}'), ', ')
@@ -199,111 +317,153 @@ begin
     -- B. UPDATE
     -- -----------------------------------------------------------------
     elsif p_op = 'update' then
-      -- Optimistic Concurrency Check
-      if p_base_version is not null then
-        execute format('select version from %I where id = $1', p_entity) into v_current_version using p_entity_id;
-        if v_current_version is not null and v_current_version <> p_base_version then
-          raise exception 'Optimistic concurrency conflict on % (%): server version % does not match base_version %',
-            p_entity, p_entity_id, v_current_version, p_base_version;
+      -- Lock row and check existence / RLS / Concurrency
+      execute format('select * from %I where id = $1 for update', p_entity)
+      into v_current_row using p_entity_id;
+
+      if v_current_row is null then
+        raise exception 'Row % in % was not found or access was denied by row-level security', p_entity_id, p_entity
+        using errcode = '42501';
+      end if;
+
+      -- Immutability of branch_id: payload cannot alter branch_id
+      if (p_payload ? 'branch_id') and (p_entity in ('documents', 'journal_entries', 'payments')) then
+        if (p_payload ->> 'branch_id')::uuid is distinct from v_current_row.branch_id then
+          raise exception 'branch_id cannot be changed on an existing record' using errcode = '23514';
         end if;
+      end if;
+
+      -- Optimistic Concurrency Check
+      if p_base_version is not null and v_current_row.version <> p_base_version then
+        perform private._internal_finalize_sync_op(p_op_id, 'rejected', 'Optimistic concurrency conflict');
+        return jsonb_build_object(
+          'success', false,
+          'status', 'conflict',
+          'code', 'conflict',
+          'op_id', p_op_id,
+          'error', 'Optimistic concurrency conflict: server version has changed',
+          'server_row', to_jsonb(v_current_row)
+        );
       end if;
 
       select string_agg(format('%I = %L', key, value #>> '{}'), ', ')
       into v_set_clause
-      from jsonb_each(v_clean_payload);
+      from jsonb_each(v_clean_payload - array['branch_id']);
 
       if v_set_clause is not null then
         execute format('update %I set %s where id = $1', p_entity, v_set_clause) using p_entity_id;
         get diagnostics v_rows_affected = row_count;
         if v_rows_affected = 0 then
-          raise exception 'Update affected 0 rows on % (%): row not found or denied by RLS', p_entity, p_entity_id;
+          raise exception 'Update affected 0 rows on % (%)', p_entity, p_entity_id using errcode = '42501';
         end if;
+      else
+        raise exception 'Payload contains no writable columns for %', p_entity using errcode = '22000';
       end if;
 
     -- -----------------------------------------------------------------
     -- C. DELETE -> SOFT DELETE (deleted_at = now())
     -- -----------------------------------------------------------------
     elsif p_op = 'delete' then
-      if p_base_version is not null then
-        execute format('select version from %I where id = $1', p_entity) into v_current_version using p_entity_id;
-        if v_current_version is not null and v_current_version <> p_base_version then
-          raise exception 'Optimistic concurrency conflict on delete % (%): server version % does not match base_version %',
-            p_entity, p_entity_id, v_current_version, p_base_version;
-        end if;
+      execute format('select * from %I where id = $1 for update', p_entity)
+      into v_current_row using p_entity_id;
+
+      if v_current_row is null then
+        raise exception 'Row % in % was not found or access was denied by row-level security', p_entity_id, p_entity
+        using errcode = '42501';
+      end if;
+
+      if p_base_version is not null and v_current_row.version <> p_base_version then
+        perform private._internal_finalize_sync_op(p_op_id, 'rejected', 'Optimistic concurrency conflict');
+        return jsonb_build_object(
+          'success', false,
+          'status', 'conflict',
+          'code', 'conflict',
+          'op_id', p_op_id,
+          'error', 'Optimistic concurrency conflict on delete',
+          'server_row', to_jsonb(v_current_row)
+        );
       end if;
 
       execute format('update %I set deleted_at = now() where id = $1 and deleted_at is null', p_entity) using p_entity_id;
       get diagnostics v_rows_affected = row_count;
       if v_rows_affected = 0 then
-        raise exception 'Delete affected 0 rows on % (%): row not found, already deleted, or denied by RLS', p_entity, p_entity_id;
+        raise exception 'Delete affected 0 rows on % (%)', p_entity, p_entity_id using errcode = '42501';
       end if;
 
     -- -----------------------------------------------------------------
     -- D. POST (Status strictly set to 'posted')
     -- -----------------------------------------------------------------
     elsif p_op = 'post' then
-      select string_agg(format('%I = %L', key, value #>> '{}'), ', ')
-      into v_set_clause
-      from jsonb_each(v_clean_payload);
+      execute format('select * from %I where id = $1 for update', p_entity)
+      into v_current_row using p_entity_id;
 
-      if v_set_clause is not null then
-        execute format('update %I set %s, status = ''posted'', posted_at = now() where id = $1', p_entity, v_set_clause) using p_entity_id;
-      else
-        execute format('update %I set status = ''posted'', posted_at = now() where id = $1', p_entity) using p_entity_id;
+      if v_current_row is null then
+        raise exception 'Row % in % was not found or access was denied by row-level security', p_entity_id, p_entity
+        using errcode = '42501';
       end if;
 
-      get diagnostics v_rows_affected = row_count;
-      if v_rows_affected = 0 then
-        raise exception 'Post affected 0 rows on % (%): row not found or denied by RLS', p_entity, p_entity_id;
+      if p_base_version is not null and v_current_row.version <> p_base_version then
+        perform private._internal_finalize_sync_op(p_op_id, 'rejected', 'Optimistic concurrency conflict');
+        return jsonb_build_object(
+          'success', false,
+          'status', 'conflict',
+          'code', 'conflict',
+          'op_id', p_op_id,
+          'error', 'Optimistic concurrency conflict on post',
+          'server_row', to_jsonb(v_current_row)
+        );
       end if;
 
-    -- -----------------------------------------------------------------
-    -- E. REVERSE (Status strictly set to 'reversed')
-    -- -----------------------------------------------------------------
-    elsif p_op = 'reverse' then
-      execute format('update %I set status = ''reversed'' where id = $1', p_entity) using p_entity_id;
+      execute format('update %I set status = ''posted'', posted_at = now() where id = $1', p_entity) using p_entity_id;
       get diagnostics v_rows_affected = row_count;
       if v_rows_affected = 0 then
-        raise exception 'Reverse affected 0 rows on % (%): row not found or denied by RLS', p_entity, p_entity_id;
+        raise exception 'Post affected 0 rows on % (%)', p_entity, p_entity_id using errcode = '42501';
       end if;
     end if;
 
     -- Finalize sync_op as applied
-    perform _internal_finalize_sync_op(p_op_id, 'applied', null);
+    perform private._internal_finalize_sync_op(p_op_id, 'applied', null);
 
     return jsonb_build_object(
       'success', true,
       'status', 'applied',
+      'code', 'ok',
       'op_id', p_op_id,
       'entity', p_entity,
       'entity_id', p_entity_id
     );
 
   exception when others then
-    -- Check if error is transient (e.g. query_canceled 57014 / statement_timeout)
-    if sqlstate = '57014' or sqlstate = '40P01' then
-      -- Re-raise transient errors so the transaction aborts and allows clean retry!
+    -- Whitelist Permanent Errors:
+    -- 23xxx (Integrity), 22xxx (Data Exception), 42501 (RLS/Privilege), P0001 (Business trigger exceptions)
+    if sqlstate like '23%' or sqlstate like '22%' or sqlstate = '42501' or sqlstate = 'P0001' then
+      v_code := case
+        when sqlstate = '42501' then 'denied_or_not_found'
+        when sqlstate like '23%' then 'constraint'
+        else 'validation'
+      end;
+
+      perform private._internal_finalize_sync_op(p_op_id, 'rejected', sqlerrm);
+
+      return jsonb_build_object(
+        'success', false,
+        'status', 'rejected',
+        'code', v_code,
+        'op_id', p_op_id,
+        'error', sqlerrm,
+        'sqlstate', sqlstate
+      );
+    else
+      -- Re-raise ALL transient and unexpected errors (40001, 55P03, 53xxx, 57xxx, 08xxx)
+      -- This aborts the transaction cleanly without recording 'rejected' in sync_ops!
       raise;
     end if;
-
-    -- Permanent error (RLS denial, check constraint, unique violation, version conflict)
-    -- Record as 'rejected' in sync_ops so subsequent retries return duplicate rejected
-    perform _internal_finalize_sync_op(p_op_id, 'rejected', sqlerrm);
-
-    return jsonb_build_object(
-      'success', false,
-      'status', 'rejected',
-      'op_id', p_op_id,
-      'error', sqlerrm,
-      'sqlstate', sqlstate
-    );
   end;
 end;
 $$;
 
 -- ---------------------------------------------------------------------
--- 3. AUTHORITATIVE ATOMIC DOCUMENT BUNDLE PUSH RPC (SECURITY INVOKER)
--- Inserts Header + Lines + Posts in ONE single transaction
+-- 5. AUTHORITATIVE ATOMIC DOCUMENT BUNDLE PUSH RPC (SECURITY INVOKER)
 -- ---------------------------------------------------------------------
 
 create or replace function sync_push_document(
@@ -316,22 +476,23 @@ create or replace function sync_push_document(
 returns jsonb
 language plpgsql
 security invoker
-set search_path = public
+set search_path = public, private
 as $$
 declare
   v_caller_uid uuid := auth.uid();
   v_claim record;
   v_doc_id uuid := (p_header ->> 'id')::uuid;
-  v_branch_id uuid := (p_header ->> 'branch_id')::uuid;
-  v_doc_type text := p_header ->> 'doc_type';
-  v_clean_header jsonb;
+  v_allowed_header_cols text[] := array['doc_type', 'series_code', 'seq_no', 'doc_no', 'doc_date', 'due_date', 'party_id', 'warehouse_id', 'currency_code', 'exchange_rate', 'payment_method', 'subtotal', 'discount_total', 'tax_total', 'total', 'notes', 'branch_id', 'source', 'pos_shift_id'];
+  v_clean_header jsonb := '{}'::jsonb;
   v_line jsonb;
   v_line_no int;
+  v_key text;
   v_col_list text;
   v_val_list text;
+  v_code text;
 begin
   if v_caller_uid is null then
-    raise exception 'Unauthorized: caller must be authenticated';
+    raise exception 'Unauthorized: caller must be authenticated' using errcode = '42501';
   end if;
 
   if v_doc_id is null then
@@ -339,13 +500,18 @@ begin
   end if;
 
   -- 1. Atomic Claim of op_id
-  select * into v_claim from _internal_claim_sync_op(
-    p_op_id, v_caller_uid, 'documents', v_doc_id, case when p_post_now then 'post' else 'insert' end,
+  select * into v_claim from private._internal_claim_sync_op(
+    p_op_id, 'documents', v_doc_id, case when p_post_now then 'post' else 'insert' end,
     p_header, null, p_client_ts
   );
 
   if v_claim.is_other_user then
-    return jsonb_build_object('success', false, 'status', 'rejected', 'error', 'Operation ID collision with another user');
+    return jsonb_build_object(
+      'success', false,
+      'status', 'rejected',
+      'code', 'validation',
+      'error', 'Operation ID collision with another user'
+    );
   end if;
 
   if not v_claim.is_claimed then
@@ -354,15 +520,19 @@ begin
       'status', 'duplicate',
       'is_duplicate', true,
       'original_result', v_claim.existing_result,
+      'code', case when v_claim.existing_result = 'applied' then 'ok' else 'constraint' end,
       'error', v_claim.existing_error
     );
   end if;
 
-  -- 2. Strip server columns from header
-  v_clean_header := p_header - array[
-    'id', 'server_seq', 'version', 'created_at', 'created_by',
-    'updated_at', 'updated_by', 'deleted_at', 'status', 'posted_at'
-  ];
+  -- 2. Build clean header strictly from allowlist
+  if p_header is not null then
+    for v_key in select * from jsonb_object_keys(p_header) loop
+      if v_key = any(v_allowed_header_cols) then
+        v_clean_header := v_clean_header || jsonb_build_object(v_key, p_header -> v_key);
+      end if;
+    end loop;
+  end if;
 
   begin
     -- 3. Insert Header (strictly as 'draft')
@@ -417,33 +587,57 @@ begin
     end if;
 
     -- Finalize sync_ops as applied
-    perform _internal_finalize_sync_op(p_op_id, 'applied', null);
+    perform private._internal_finalize_sync_op(p_op_id, 'applied', null);
 
     return jsonb_build_object(
       'success', true,
       'status', 'applied',
+      'code', 'ok',
       'op_id', p_op_id,
       'document_id', v_doc_id
     );
 
   exception when others then
-    if sqlstate = '57014' or sqlstate = '40P01' then
+    if sqlstate like '23%' or sqlstate like '22%' or sqlstate = '42501' or sqlstate = 'P0001' then
+      v_code := case
+        when sqlstate = '42501' then 'denied_or_not_found'
+        when sqlstate like '23%' then 'constraint'
+        else 'validation'
+      end;
+
+      perform private._internal_finalize_sync_op(p_op_id, 'rejected', sqlerrm);
+
+      return jsonb_build_object(
+        'success', false,
+        'status', 'rejected',
+        'code', v_code,
+        'op_id', p_op_id,
+        'error', sqlerrm,
+        'sqlstate', sqlstate
+      );
+    else
       raise;
     end if;
-
-    perform _internal_finalize_sync_op(p_op_id, 'rejected', sqlerrm);
-
-    return jsonb_build_object(
-      'success', false,
-      'status', 'rejected',
-      'op_id', p_op_id,
-      'error', sqlerrm,
-      'sqlstate', sqlstate
-    );
   end;
 end;
 $$;
 
--- Grant execution to authenticated only (NO anon, NO public)
 grant execute on function sync_push_op(uuid, text, uuid, text, jsonb, int, timestamptz) to authenticated;
 grant execute on function sync_push_document(uuid, jsonb, jsonb, boolean, timestamptz) to authenticated;
+
+-- ---------------------------------------------------------------------
+-- 6. RLS UPDATE POLICY HARDENING (WITH CHECK prevents branch relocation)
+-- ---------------------------------------------------------------------
+
+alter policy documents_update on documents with check (
+  user_has_branch(branch_id) and (has_perm(doc_module(doc_type), 'edit') or has_perm(doc_module(doc_type), 'post') or is_admin())
+);
+
+alter policy journal_entries_update on journal_entries with check (
+  user_has_branch(branch_id) and (has_perm('accounting', 'edit') or has_perm('accounting', 'post') or is_admin())
+);
+
+alter policy payments_update on payments with check (
+  user_has_branch(branch_id) and (has_perm('treasury', 'edit') or has_perm('treasury', 'post') or is_admin())
+);
+

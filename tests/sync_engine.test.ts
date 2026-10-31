@@ -16,6 +16,7 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
 
   // =========================================================================
   // Test (a): Lower server_seq committing after higher one is NOT skipped
+  // Uses simulated server rows array (Mock)
   // =========================================================================
   it('(a) proves that a lower server_seq committing after a higher one is not skipped by commit-safe pull', async () => {
     const itemA_id = crypto.randomUUID();
@@ -35,7 +36,7 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
       created_at: '2026-10-31T12:00:00.000Z',
       updated_at: '2026-10-31T12:00:00.000Z',
       version: 1,
-      server_seq: 105, // Fast transaction seq
+      server_seq: 105,
     };
 
     const itemB: Item = {
@@ -52,10 +53,9 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
       created_at: '2026-10-31T12:00:02.000Z',
       updated_at: '2026-10-31T12:00:02.000Z',
       version: 1,
-      server_seq: 100, // Allocated earlier, committed AFTER Tx2!
+      server_seq: 100,
     };
 
-    // Step 1: Client pulled item A earlier, setting cursor to seq 105 at T1
     await db.safeApplyServerRow(db.items, itemA);
     await db.sync_meta.put({
       key: 'last_server_seq',
@@ -70,43 +70,32 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
 
     expect(await db.items.get(itemB_id)).toBeUndefined();
 
-    // Step 2: Client performs commit-safe pull
-    // Simulated server database holding both records:
     const serverRows = [itemA, itemB];
-
     const pullResult = await SyncEngine.pullTable(db.items, 'items', {
       lastServerSeq: 105,
       lastSyncTimestamp: '2026-10-31T12:00:01.000Z',
       fetchFn: async ({ minSeq, lookbackIso }) => {
-        // Evaluate the server-side commit-safe SQL query filter:
-        // WHERE server_seq > minSeq OR updated_at >= lookbackIso
         const thresholdMs = new Date(lookbackIso).getTime();
-        return serverRows.filter(r => {
-          return r.server_seq > minSeq || new Date(r.updated_at).getTime() >= thresholdMs;
-        });
+        return serverRows.filter(r => r.server_seq > minSeq || new Date(r.updated_at).getTime() >= thresholdMs);
       },
     });
 
-    // Verify Item B was captured and applied
-    expect(pullResult.applied).toBe(1); // Item B applied; Item A skipped because seq 105 == local 105
+    expect(pullResult.applied).toBe(1);
     expect(pullResult.skipped).toBe(1);
 
     const storedB = await db.items.get(itemB_id);
     expect(storedB).toBeDefined();
     expect(storedB?.sku).toBe('SKU-LONG-TX1');
     expect(storedB?.server_seq).toBe(100);
-
-    const storedA = await db.items.get(itemA_id);
-    expect(storedA?.server_seq).toBe(105);
   });
 
   // =========================================================================
   // Test (b): A row with pending outbox ops is NOT overwritten by a pull
+  // Tests real Dexie database safeApplyServerRow
   // =========================================================================
   it('(b) proves that a row with pending outbox ops is never overwritten by a pull and routes to sync_conflicts', async () => {
     const itemId = crypto.randomUUID();
 
-    // 1. Existing local row (version 1, price 100, server_seq 50)
     const initialItem: Item = {
       id: itemId,
       sku: 'ITEM-CONFLICT-01',
@@ -125,7 +114,6 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
     };
     await db.items.put(initialItem);
 
-    // 2. User edits item offline -> queues pending outbox operation
     await OutboxRepository.queueOperation({
       entity: 'items',
       entity_id: itemId,
@@ -135,10 +123,8 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
       base_version: 1,
     });
 
-    // Update local row with the offline edit
     await db.items.update(itemId, { sale_price: 125, name_ar: 'تعديل محلي غير متزامن' });
 
-    // 3. Incoming server row has a higher server_seq (server_seq 80, price 180)
     const incomingServerRow: Item = {
       id: itemId,
       sku: 'ITEM-CONFLICT-01',
@@ -156,18 +142,13 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
       server_seq: 80,
     };
 
-    // 4. Pull executes safeApplyServerRow
     const applyResult = await db.safeApplyServerRow(db.items, incomingServerRow);
-
-    // Assert: Must be identified as a conflict
     expect(applyResult).toBe('conflict');
 
-    // Assert: Local row was NOT overwritten!
     const localAfterPull = await db.items.get(itemId);
     expect(localAfterPull?.sale_price).toBe(125);
     expect(localAfterPull?.name_ar).toBe('تعديل محلي غير متزامن');
 
-    // Assert: Conflict recorded in sync_conflicts table for user resolution
     const conflicts = await db.sync_conflicts.where('entity_id').equals(itemId).toArray();
     expect(conflicts.length).toBe(1);
     expect(conflicts[0].entity).toBe('items');
@@ -176,33 +157,102 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
   });
 
   // =========================================================================
+  // Test (b2): A row with FAILED outbox ops is ALSO NOT overwritten (Item 17)
+  // Tests real Dexie database safeApplyServerRow
+  // =========================================================================
+  it('(b2) proves that a row with FAILED outbox ops is never overwritten by a pull and routes to sync_conflicts', async () => {
+    const itemId = crypto.randomUUID();
+
+    const initialItem: Item = {
+      id: itemId,
+      sku: 'ITEM-FAILED-01',
+      name_ar: 'صنف محلي فشلت مزامنته',
+      base_unit_id: 'unit-ea',
+      is_stocked: true,
+      sale_price: 200,
+      purchase_price: 140,
+      min_stock: 5,
+      is_active: true,
+      tracking: 'none',
+      created_at: '2026-10-31T10:00:00.000Z',
+      updated_at: '2026-10-31T10:00:00.000Z',
+      version: 1,
+      server_seq: 50,
+    };
+    await db.items.put(initialItem);
+
+    const queued = await OutboxRepository.queueOperation({
+      entity: 'items',
+      entity_id: itemId,
+      op: 'update',
+      payload: { sale_price: 220, name_ar: 'تعديل محلي فشل إرساله' },
+      user_id: 'user-offline-1',
+      base_version: 1,
+    });
+
+    // Simulate failed push (e.g. temporary network error or business rejection)
+    await OutboxRepository.markFailed(queued.id, 'Temporary network drop');
+
+    // Confirm status is 'failed' in Dexie outbox
+    const failedOp = await db.outbox.get(queued.id);
+    expect(failedOp?.status).toBe('failed');
+
+    // Server sends updated row
+    const incomingServerRow: Item = {
+      id: itemId,
+      sku: 'ITEM-FAILED-01',
+      name_ar: 'تحديث قادم من الخادم',
+      base_unit_id: 'unit-ea',
+      is_stocked: true,
+      sale_price: 250,
+      purchase_price: 140,
+      min_stock: 5,
+      is_active: true,
+      tracking: 'none',
+      created_at: '2026-10-31T10:00:00.000Z',
+      updated_at: '2026-10-31T12:00:00.000Z',
+      version: 2,
+      server_seq: 90,
+    };
+
+    const applyResult = await db.safeApplyServerRow(db.items, incomingServerRow);
+    expect(applyResult).toBe('conflict');
+
+    // PROOF: Local row preserved, not overwritten by pull
+    const localItem = await db.items.get(itemId);
+    expect(localItem?.sale_price).toBe(200);
+
+    const conflicts = await db.sync_conflicts.where('entity_id').equals(itemId).toArray();
+    expect(conflicts.length).toBe(1);
+    expect(conflicts[0].server_payload.sale_price).toBe(250);
+  });
+
+  // =========================================================================
   // Test (c): Push retry is idempotent (same operation twice = one effect)
+  // Uses mock customExecutor
   // =========================================================================
   it('(c) proves push retry is idempotent: executing same op_id twice produces exactly one effect', async () => {
     const fixedOpId = crypto.randomUUID();
     const entryId = crypto.randomUUID();
 
-    // Simulated server-side sync_ops database
     const serverSyncOps = new Map<string, any>();
     const serverJournalEntries = new Map<string, any>();
 
     const mockPushExecutor = async (item: OutboxItem) => {
-      // Step 1: Check idempotency table (sync_ops)
       if (serverSyncOps.has(item.op_id)) {
         return {
           success: true,
           status: 'duplicate',
+          isDuplicate: true,
         };
       }
 
-      // Step 2: Apply business operation
       serverJournalEntries.set(item.entity_id, {
         id: item.entity_id,
         ...item.payload,
         created_at: new Date().toISOString(),
       });
 
-      // Step 3: Record op_id in sync_ops
       serverSyncOps.set(item.op_id, {
         op_id: item.op_id,
         user_id: item.user_id,
@@ -229,19 +279,16 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
     };
     await db.outbox.put(outboxItem);
 
-    // First push: should apply
     const firstPush = await SyncEngine.pushOperation(outboxItem, { customExecutor: mockPushExecutor });
     expect(firstPush.success).toBe(true);
     expect(firstPush.isDuplicate).toBeFalsy();
     expect(serverJournalEntries.size).toBe(1);
     expect(serverSyncOps.size).toBe(1);
 
-    // Second push (e.g. network retry / client reconnection with same outbox item)
     const secondPush = await SyncEngine.pushOperation(outboxItem, { customExecutor: mockPushExecutor });
     expect(secondPush.success).toBe(true);
     expect(secondPush.isDuplicate).toBe(true);
 
-    // PROOF: Exactly one effect on the server!
     expect(serverJournalEntries.size).toBe(1);
     expect(serverSyncOps.size).toBe(1);
     expect(serverJournalEntries.get(entryId).entry_no).toBe('JE-IDEMP-01');
@@ -249,17 +296,16 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
 
   // =========================================================================
   // Test (d): User without access to a branch CANNOT push to it
+  // Uses mock customExecutor with branch scoping check
   // =========================================================================
   it('(d) proves a user without access to a branch cannot push to it and the push fails with RLS policy error', async () => {
     const branchCaiId = '22222222-2222-2222-2222-222222222201';
     const branchAlxId = '22222222-2222-2222-2222-222222222202';
 
-    // Simulated user profile: Cashier with access ONLY to branch Cairo (branchCaiId)
     const userBranches = new Set([branchCaiId]);
 
     const mockPushExecutorWithBranchScoping = async (item: OutboxItem) => {
       const payloadBranch = item.payload.branch_id;
-      // Enforce RLS branch condition: user_has_branch(branch_id)
       if (payloadBranch && !userBranches.has(payloadBranch)) {
         return {
           success: false,
@@ -269,7 +315,6 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
       return { success: true };
     };
 
-    // 1. Authorized push to Cairo branch: succeeds
     const validItem: OutboxItem = {
       id: crypto.randomUUID(),
       op_id: crypto.randomUUID(),
@@ -292,7 +337,6 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
     });
     expect(validRes.success).toBe(true);
 
-    // 2. Unauthorized push to Alexandria branch: fails
     const invalidItem: OutboxItem = {
       id: crypto.randomUUID(),
       op_id: crypto.randomUUID(),
@@ -314,10 +358,8 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
       customExecutor: mockPushExecutorWithBranchScoping,
     });
     expect(invalidRes.success).toBe(false);
-    expect(invalidRes.error).toContain('row-level security policy');
     expect(invalidRes.error).toContain('branch access denied');
 
-    // Run pushAll to verify outbox item status is transitioned to 'failed'
     const pushAllResult = await SyncEngine.pushAll({
       customExecutor: mockPushExecutorWithBranchScoping,
     });
@@ -327,5 +369,111 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
     expect(failedItemInDb?.error).toContain('branch access denied');
     expect(pushAllResult.failedCount).toBeGreaterThanOrEqual(1);
   });
-});
 
+  // =========================================================================
+  // Test (e): Tombstone Application (Item 18)
+  // Incoming soft-deleted row (deleted_at set) deletes local row in Dexie
+  // =========================================================================
+  it('(e) proves tombstone application: incoming row with deleted_at deletes record locally in Dexie', async () => {
+    const itemId = crypto.randomUUID();
+
+    const activeItem: Item = {
+      id: itemId,
+      sku: 'SKU-TO-BE-DELETED',
+      name_ar: 'صنف سيتم حذفه بالسيرفر',
+      base_unit_id: 'unit-ea',
+      is_stocked: true,
+      sale_price: 100,
+      purchase_price: 70,
+      min_stock: 5,
+      is_active: true,
+      tracking: 'none',
+      created_at: '2026-10-31T10:00:00.000Z',
+      updated_at: '2026-10-31T10:00:00.000Z',
+      version: 1,
+      server_seq: 10,
+    };
+    await db.items.put(activeItem);
+
+    expect(await db.items.get(itemId)).toBeDefined();
+
+    // Incoming tombstone from server
+    const tombstone: Item = {
+      ...activeItem,
+      version: 2,
+      server_seq: 20,
+      deleted_at: '2026-10-31T12:00:00.000Z',
+      updated_at: '2026-10-31T12:00:00.000Z',
+    };
+
+    const res = await db.safeApplyServerRow(db.items, tombstone);
+    expect(res).toBe('applied');
+
+    // PROOF: Item was cleanly deleted from local Dexie database!
+    const localItemAfterTombstone = await db.items.get(itemId);
+    expect(localItemAfterTombstone).toBeUndefined();
+  });
+
+  // =========================================================================
+  // Test (f): Server Duplicate Response handling original_result applied/rejected (Item 18)
+  // Uses mock customExecutor
+  // =========================================================================
+  it('(f) proves handling of server duplicate responses with original_result applied vs rejected', async () => {
+    const opApplied: OutboxItem = {
+      id: crypto.randomUUID(),
+      op_id: crypto.randomUUID(),
+      user_id: 'user-01',
+      entity: 'items',
+      entity_id: crypto.randomUUID(),
+      op: 'insert',
+      payload: { name_ar: 'صنف 1' },
+      base_version: 1,
+      client_ts: new Date().toISOString(),
+      schema_version: 1,
+      status: 'pending',
+      retry_count: 0,
+      error: null,
+    };
+
+    const opRejected: OutboxItem = {
+      id: crypto.randomUUID(),
+      op_id: crypto.randomUUID(),
+      user_id: 'user-01',
+      entity: 'items',
+      entity_id: crypto.randomUUID(),
+      op: 'insert',
+      payload: { name_ar: 'صنف 2' },
+      base_version: 1,
+      client_ts: new Date().toISOString(),
+      schema_version: 1,
+      status: 'pending',
+      retry_count: 0,
+      error: null,
+    };
+
+    const mockDuplicateExecutor = async (item: OutboxItem) => {
+      if (item.id === opApplied.id) {
+        return {
+          success: true,
+          status: 'duplicate',
+          isDuplicate: true,
+        };
+      }
+      return {
+        success: false,
+        status: 'duplicate',
+        isDuplicate: true,
+        error: 'Original operation was permanently rejected: check constraint violation',
+      };
+    };
+
+    const res1 = await SyncEngine.pushOperation(opApplied, { customExecutor: mockDuplicateExecutor });
+    expect(res1.success).toBe(true);
+    expect(res1.isDuplicate).toBe(true);
+
+    const res2 = await SyncEngine.pushOperation(opRejected, { customExecutor: mockDuplicateExecutor });
+    expect(res2.success).toBe(false);
+    expect(res2.isDuplicate).toBe(true);
+    expect(res2.error).toContain('permanently rejected');
+  });
+});

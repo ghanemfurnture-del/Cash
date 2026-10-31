@@ -244,10 +244,10 @@ export class CashERPDatabase extends Dexie {
    * 2. Strict sequence comparison: NO 'OR' between server_seq and version.
    */
   async safeApplyServerRow<T extends BaseEntity>(table: Table<T, string>, serverRow: T): Promise<'applied' | 'conflict' | 'skipped'> {
-    // 1. Check for pending outbox changes on this entity
+    // 1. Check for pending, in_flight OR failed outbox changes on this entity
     const pendingOutboxCount = await this.outbox
       .where('entity').equals(table.name)
-      .and(op => op.entity_id === serverRow.id && (op.status === 'pending' || op.status === 'in_flight'))
+      .and(op => op.entity_id === serverRow.id && (op.status === 'pending' || op.status === 'in_flight' || op.status === 'failed'))
       .count();
 
     const localRow = await table.get(serverRow.id);
@@ -274,6 +274,11 @@ export class CashERPDatabase extends Dexie {
 
     // 2. Strict sequence check: Only apply if server_seq is strictly greater than local
     if (!localRow || serverRow.server_seq > localRow.server_seq) {
+      if (serverRow.deleted_at) {
+        // Tombstone application: soft-deleted on server -> delete locally from Dexie
+        await table.delete(serverRow.id);
+        return 'applied';
+      }
       await table.put(serverRow);
       return 'applied';
     }
