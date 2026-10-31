@@ -6,11 +6,13 @@ import { IS_DEV_MOCK_AUTH_ENABLED } from '../../lib/supabase';
 
 export const LoginPage: React.FC<{ onLoginSuccess?: () => void }> = ({ onLoginSuccess }) => {
   const { t } = useTranslation();
-  const { login } = useAuth();
+  const { login, authError, clearAuthError } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const displayError = error || authError;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -21,6 +23,7 @@ export const LoginPage: React.FC<{ onLoginSuccess?: () => void }> = ({ onLoginSu
 
     setLoading(true);
     setError(null);
+    clearAuthError();
 
     try {
       await login(email, password);
@@ -63,6 +66,7 @@ export const LoginPage: React.FC<{ onLoginSuccess?: () => void }> = ({ onLoginSu
               onChange={(e) => {
                 setEmail(e.target.value);
                 if (error) setError(null);
+                if (authError) clearAuthError();
               }}
               className="w-full px-3 py-2 text-xs rounded-xl border border-input bg-background text-foreground focus:outline-hidden focus:ring-2 focus:ring-primary/20 transition-all placeholder:text-muted-foreground"
               placeholder="user@company.com"
@@ -82,6 +86,7 @@ export const LoginPage: React.FC<{ onLoginSuccess?: () => void }> = ({ onLoginSu
               onChange={(e) => {
                 setPassword(e.target.value);
                 if (error) setError(null);
+                if (authError) clearAuthError();
               }}
               className="w-full px-3 py-2 text-xs rounded-xl border border-input bg-background text-foreground focus:outline-hidden focus:ring-2 focus:ring-primary/20 transition-all placeholder:text-muted-foreground"
               placeholder="••••••••"
@@ -98,13 +103,13 @@ export const LoginPage: React.FC<{ onLoginSuccess?: () => void }> = ({ onLoginSu
           </button>
 
           {/* Clear Arabic Error Message Rendered Directly Under The Submit Button */}
-          {error && (
+          {displayError && (
             <div
               role="alert"
               className="p-3 text-xs rounded-xl bg-destructive/10 text-destructive border border-destructive/20 flex items-start gap-2 animate-in fade-in slide-in-from-top-1 duration-200"
             >
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-              <span className="font-semibold leading-relaxed">{error}</span>
+              <span className="font-semibold leading-relaxed">{displayError}</span>
             </div>
           )}
         </form>

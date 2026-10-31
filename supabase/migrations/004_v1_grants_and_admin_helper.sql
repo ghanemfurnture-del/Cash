@@ -160,3 +160,4 @@ begin
     execute 'alter role anon set transaction_timeout = ''10s''';
   end if;
 end $$;
+

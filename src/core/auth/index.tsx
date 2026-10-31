@@ -16,6 +16,8 @@ export interface UserSession {
 interface AuthContextType {
   session: UserSession | null;
   loading: boolean;
+  authError: string | null;
+  clearAuthError: () => void;
   currentBranch: Branch | null;
   switchBranch: (branchId: string) => Promise<void>;
   hasPermission: (module: string, action: string) => boolean;
@@ -30,6 +32,9 @@ const SESSION_STORAGE_KEY = 'cash_erp_validated_session';
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [session, setSession] = useState<UserSession | null>(null);
   const [loading, setLoading] = useState(true);
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  const clearAuthError = () => setAuthError(null);
 
   // Request Persistent Storage on Mount (PWA Offline Safety)
   useEffect(() => {
@@ -62,7 +67,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             setSession(null);
           }
         }
-      } catch (err) {
+      } catch (err: any) {
         console.error('Failed to initialize session:', err);
       } finally {
         setLoading(false);
@@ -77,8 +82,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (event === 'SIGNED_IN' && sbSession?.user) {
           try {
             await loadAndValidateUserProfile(sbSession.user.id, sbSession.user.email || '');
-          } catch (err) {
-            console.error('Profile validation failed on auth change:', err);
+          } catch (err: any) {
+            const rejectionMsg = err?.message || 'هذا المستخدم غير مسجل في شركة أو حسابه غير نشط...';
+            console.error('Profile validation failed on auth change:', rejectionMsg);
+            setAuthError(rejectionMsg);
             await supabase.auth.signOut();
             setSession(null);
             localStorage.removeItem(SESSION_STORAGE_KEY);
@@ -199,6 +206,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
    */
   const login = async (email: string, password: string): Promise<void> => {
     setLoading(true);
+    setAuthError(null);
 
     try {
       // DEV MOCK ONLY (Off by default; requires VITE_ENABLE_DEV_MOCK_AUTH=true in .env.local)
@@ -268,9 +276,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // Load Profile & Roles under RLS policies
       await loadAndValidateUserProfile(authData.user.id, authData.user.email || email);
     } catch (err: any) {
+      const msg = err?.message || 'تعذر تسجيل الدخول بالبيانات المدخلة.';
+      setAuthError(msg);
       // In case of profile validation failure, sign out from Supabase auth
       if (!IS_DEV_MOCK_AUTH_ENABLED) {
-        await supabase.auth.signOut();
+        try {
+          await supabase.auth.signOut();
+        } catch {
+          // ignore signout errors
+        }
       }
       setSession(null);
       localStorage.removeItem(SESSION_STORAGE_KEY);
@@ -311,6 +325,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       value={{
         session,
         loading,
+        authError,
+        clearAuthError,
         currentBranch,
         switchBranch,
         hasPermission,

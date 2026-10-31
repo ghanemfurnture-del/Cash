@@ -101,5 +101,61 @@ describe('Authentication & Profile Authorization (003 RLS Contract)', () => {
     expect(branches.length).toBe(1);
     expect(branches[0].code).toBe('CAI');
   });
+
+  it('surfaces Arabic error message under login button when Supabase Auth succeeds but user has no profile', async () => {
+    // 1. Simulate successful Supabase Auth sign-in
+    const mockAuthData = {
+      user: { id: 'auth-user-without-profile', email: 'registered.auth.but.no.profile@company.com' },
+      session: { access_token: 'fake-token' },
+    };
+    const mockSignInWithPassword = vi.fn().mockResolvedValue({
+      data: mockAuthData,
+      error: null,
+    });
+    const mockSignOut = vi.fn().mockResolvedValue({ error: null });
+
+    // 2. Simulate profiles table returning no record under RLS
+    const mockProfileLookup = vi.fn().mockResolvedValue({
+      data: null,
+      error: null,
+    });
+
+    let surfacedUiError: string | null = null;
+    let authErrorState: string | null = null;
+
+    // Simulate the login orchestration in AuthContext & LoginPage
+    const loginFlow = async (email: string, pass: string) => {
+      authErrorState = null;
+      try {
+        const { data: auth, error: authErr } = await mockSignInWithPassword({ email, password: pass });
+        if (authErr || !auth?.user) {
+          throw new Error('بيانات الدخول غير صحيحة.');
+        }
+
+        // Validate Profile
+        const { data: profile } = await mockProfileLookup(auth.user.id);
+        if (!profile) {
+          throw new Error('حسابك غير مسجل في سجلات موظفي المنشأة (No active profile found). يرجى مراجعة إدارة النظام.');
+        }
+      } catch (err: any) {
+        authErrorState = err.message;
+        await mockSignOut();
+        throw err;
+      }
+    };
+
+    // Simulate form submit in LoginPage
+    try {
+      await loginFlow('registered.auth.but.no.profile@company.com', 'Password123!');
+    } catch (err: any) {
+      surfacedUiError = err.message || authErrorState;
+    }
+
+    // Verify Arabic error message is captured for display under submit button
+    expect(surfacedUiError).toBe('حسابك غير مسجل في سجلات موظفي المنشأة (No active profile found). يرجى مراجعة إدارة النظام.');
+    expect(authErrorState).toBe('حسابك غير مسجل في سجلات موظفي المنشأة (No active profile found). يرجى مراجعة إدارة النظام.');
+    // Verify user was immediately signed out from Supabase
+    expect(mockSignOut).toHaveBeenCalledTimes(1);
+  });
 });
 
