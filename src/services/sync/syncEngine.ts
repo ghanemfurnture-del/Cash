@@ -233,49 +233,36 @@ export class SyncEngine {
   }
 
   /**
-   * Direct user operation execution (fallback when edge function not hosted locally)
-   * Guaranteed to use caller's JWT, enforcing RLS and branch scoping.
+   * Direct user operation execution (calls atomic sync_push_op RPC)
+   * Guaranteed to use caller's JWT, enforcing RLS, branch scoping, and atomicity.
    */
   static async executeDirectUserOperation(item: OutboxItem): Promise<{ success: boolean; isDuplicate?: boolean; error?: string }> {
-    const table = supabase.from(item.entity as any);
-
-    if (item.op === 'insert') {
-      const { error } = await (table.insert as any)(item.payload);
-      if (error) {
-        // 23505 = unique_violation (already inserted with same PK -> idempotent)
-        if (error.code === '23505') {
-          return { success: true, isDuplicate: true };
-        }
-        return { success: false, error: error.message };
-      }
-    } else if (item.op === 'update' || item.op === 'post' || item.op === 'reverse') {
-      const { error } = await (table.update as any)(item.payload).eq('id', item.entity_id);
-      if (error) {
-        return { success: false, error: error.message };
-      }
-    } else if (item.op === 'delete') {
-      const { error } = await table.delete().eq('id', item.entity_id);
-      if (error) {
-        return { success: false, error: error.message };
-      }
-    }
-
-    // Record op_id in sync_ops via RPC
     try {
-      await (supabase.rpc as any)('record_sync_op', {
+      const { data, error } = await (supabase.rpc as any)('sync_push_op', {
         p_op_id: item.op_id,
         p_entity: item.entity,
         p_entity_id: item.entity_id,
         p_op: item.op,
         p_payload: item.payload,
-        p_base_version: item.base_version || 1,
-        p_result: 'applied',
+        p_base_version: item.base_version || null,
+        p_client_ts: item.client_ts || new Date().toISOString(),
       });
-    } catch {
-      // Optional logging; non-blocking for business operation
-    }
 
-    return { success: true };
+      if (error) {
+        return { success: false, error: error.message };
+      }
+
+      if (!data?.success) {
+        if (data?.status === 'duplicate') {
+          return { success: data.original_result === 'applied', isDuplicate: true, error: data.error };
+        }
+        return { success: false, error: data?.error || 'Operation rejected by server' };
+      }
+
+      return { success: true, isDuplicate: data?.status === 'duplicate' };
+    } catch (err: any) {
+      return { success: false, error: err.message || String(err) };
+    }
   }
 
   /**

@@ -1,12 +1,9 @@
 // =====================================================================
 // supabase/functions/sync-push/index.ts
 // Phase 2b-2: Authoritative Sync-Push Edge Function
-// MANDATORY ARCHITECTURAL REQUIREMENT:
-// 1. Validates caller JWT from Authorization header (Bearer <caller_jwt>).
-// 2. Executes ALL business operations (insert, update, delete, post)
-//    exclusively under a client initialized with the caller's JWT.
-//    (Guarantees RLS branch scoping, permission enforcement, and audit_row logging).
-// 3. service_role client is used ONLY for internal sync_ops logging.
+// Delegates business mutations to atomic, single-transaction RPCs
+// executed under the caller's JWT (Bearer <caller_jwt>).
+// Guarantees zero out-of-transaction bookkeeping and 100% atomicity.
 // =====================================================================
 
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
@@ -14,17 +11,6 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.45.4';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL') || '';
 const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY') || '';
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '';
-
-interface PushPayload {
-  op_id: string;
-  entity: string;
-  entity_id: string;
-  op: 'insert' | 'update' | 'delete' | 'post' | 'reverse';
-  payload: Record<string, any>;
-  base_version?: number;
-  client_ts?: string;
-}
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -37,9 +23,7 @@ serve(async (req) => {
   }
 
   try {
-    // -----------------------------------------------------------------
-    // 1. EXTRACT & VERIFY CALLER JWT
-    // -----------------------------------------------------------------
+    // 1. Extract Bearer Token
     const authHeader = req.headers.get('Authorization');
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return new Response(
@@ -50,58 +34,7 @@ serve(async (req) => {
 
     const callerJwt = authHeader.replace('Bearer ', '');
 
-    // Internal admin client (USED ONLY for sync_ops bookkeeping)
-    const adminClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-      auth: { persistSession: false },
-    });
-
-    // Verify caller identity with Supabase Auth
-    const { data: userData, error: userError } = await adminClient.auth.getUser(callerJwt);
-    if (userError || !userData?.user) {
-      return new Response(
-        JSON.stringify({ error: 'Unauthorized: Invalid caller token', details: userError?.message }),
-        { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    const userId = userData.user.id;
-
-    // -----------------------------------------------------------------
-    // 2. PARSE PAYLOAD & CHECK IDEMPOTENCY
-    // -----------------------------------------------------------------
-    const body: PushPayload = await req.json();
-    const { op_id, entity, entity_id, op, payload, base_version } = body;
-
-    if (!op_id || !entity || !entity_id || !op) {
-      return new Response(
-        JSON.stringify({ error: 'Bad Request: op_id, entity, entity_id, and op are required' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Check if op_id was already processed in sync_ops (Idempotency)
-    const { data: existingOp } = await adminClient
-      .from('sync_ops')
-      .select('id, result, created_at')
-      .eq('op_id', op_id)
-      .maybeSingle();
-
-    if (existingOp) {
-      return new Response(
-        JSON.stringify({
-          status: 'duplicate',
-          op_id,
-          result: existingOp.result,
-          message: 'Operation was already applied (idempotent retry)',
-        }),
-        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // -----------------------------------------------------------------
-    // 3. EXECUTE BUSINESS OPERATION UNDER CALLER JWT (RLS ENFORCED)
-    // -----------------------------------------------------------------
-    // Client configured with caller's JWT token:
+    // 2. Initialize Supabase client strictly with the caller's JWT
     const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
       auth: { persistSession: false },
       global: {
@@ -109,91 +42,52 @@ serve(async (req) => {
       },
     });
 
-    let opResult: any = null;
-    let opError: any = null;
+    const body = await req.json();
 
-    if (op === 'insert') {
-      const { data, error } = await userClient.from(entity).insert(payload).select().maybeSingle();
-      opResult = data;
-      opError = error;
-    } else if (op === 'update') {
-      const { data, error } = await userClient.from(entity).update(payload).eq('id', entity_id).select().maybeSingle();
-      opResult = data;
-      opError = error;
-    } else if (op === 'delete') {
-      const { data, error } = await userClient.from(entity).delete().eq('id', entity_id).select().maybeSingle();
-      opResult = data;
-      opError = error;
-    } else if (op === 'post') {
-      // Posting a document or journal entry: updates status to 'posted' under RLS
-      const { data, error } = await userClient.from(entity).update({
-        status: 'posted',
-        posted_at: new Date().toISOString(),
-        ...payload,
-      }).eq('id', entity_id).select().maybeSingle();
-      opResult = data;
-      opError = error;
-    } else if (op === 'reverse') {
-      const { data, error } = await userClient.from(entity).update({
-        status: 'reversed',
-        ...payload,
-      }).eq('id', entity_id).select().maybeSingle();
-      opResult = data;
-      opError = error;
+    // 3. Dispatch to atomic, single-transaction PostgreSQL RPCs
+    let rpcResponse: any;
+
+    if (body.document_bundle) {
+      // Document Bundle: Header + Lines + Optional Post
+      const { op_id, header, lines, post_now, client_ts } = body.document_bundle;
+      rpcResponse = await userClient.rpc('sync_push_document', {
+        p_op_id: op_id,
+        p_header: header,
+        p_lines: lines,
+        p_post_now: Boolean(post_now),
+        p_client_ts: client_ts || new Date().toISOString(),
+      });
+    } else {
+      // Single Entity Operation
+      const { op_id, entity, entity_id, op, payload, base_version, client_ts } = body;
+      rpcResponse = await userClient.rpc('sync_push_op', {
+        p_op_id: op_id,
+        p_entity: entity,
+        p_entity_id: entity_id,
+        p_op: op,
+        p_payload: payload,
+        p_base_version: base_version || null,
+        p_client_ts: client_ts || new Date().toISOString(),
+      });
     }
 
-    // -----------------------------------------------------------------
-    // 4. RECORD AUDIT RESULT IN SYNC_OPS VIA ADMIN CLIENT
-    // -----------------------------------------------------------------
-    if (opError) {
-      // Record rejected/failed op
-      await adminClient.from('sync_ops').insert({
-        op_id,
-        user_id: userId,
-        entity,
-        entity_id,
-        op,
-        payload,
-        base_version: base_version || 1,
-        client_ts: body.client_ts || new Date().toISOString(),
-        schema_version: 1,
-        result: 'rejected',
-        error: opError.message,
-      });
-
+    if (rpcResponse.error) {
       return new Response(
         JSON.stringify({
           success: false,
-          op_id,
-          error: opError.message,
-          code: opError.code,
+          error: rpcResponse.error.message,
+          code: rpcResponse.error.code,
         }),
-        { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    // Record applied op
-    await adminClient.from('sync_ops').insert({
-      op_id,
-      user_id: userId,
-      entity,
-      entity_id,
-      op,
-      payload,
-      base_version: base_version || 1,
-      client_ts: body.client_ts || new Date().toISOString(),
-      schema_version: 1,
-      result: 'applied',
-    });
+    const result = rpcResponse.data;
+    const httpStatus = result.success ? 200 : (result.status === 'duplicate' ? 200 : 403);
 
     return new Response(
-      JSON.stringify({
-        success: true,
-        status: 'applied',
-        op_id,
-        data: opResult,
-      }),
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      JSON.stringify(result),
+      { status: httpStatus, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (err: any) {
     return new Response(
