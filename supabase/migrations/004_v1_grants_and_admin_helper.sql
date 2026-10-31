@@ -2,16 +2,17 @@
 -- 004_v1_grants_and_admin_helper.sql
 -- 1. Helper function is_admin() (seed dependency on r.name = 'Admin')
 -- 2. Optimize minimal RLS policies to use is_admin() (zero recursion)
--- 3. REVOKE default public/anon access after "Automatically expose tables"
--- 4. ALTER DEFAULT PRIVILEGES: Engine-level deny-by-default for new tables
--- 5. GRANT explicit access to authenticated ONLY for v1 modules
--- 6. ALTER VIEW SET (security_invoker = true) for all public views
--- 7. Role Timeouts: service_role bounded to 60s (Postgres 17 transaction_timeout)
+-- 3. REVOKE default public/anon access from all tables & sequences
+-- 4. Function security: REVOKE EXECUTE from anon/PUBLIC; GRANT only app helpers
+-- 5. ALTER DEFAULT PRIVILEGES: Engine-level deny-by-default for future objects
+-- 6. GRANT explicit access to authenticated ONLY for v1 modules & v1 views
+-- 7. ALTER VIEW SET (security_invoker = true) on ALL 12 public views
+-- 8. Role Timeouts: service_role bounded to 60s (Postgres 17 transaction_timeout)
 -- =====================================================================
 
 /*
 =====================================================================
-VERIFICATION QUERIES (Run after applying 004 in Supabase SQL Editor):
+VERIFICATION QUERIES (Run in Supabase SQL Editor after applying 004):
 =====================================================================
 
 -- 1. Verify is_admin() function definition and security definer status:
@@ -42,20 +43,32 @@ SELECT table_name, privilege_type
 FROM information_schema.role_table_grants
 WHERE table_schema = 'public' AND grantee = 'authenticated' AND table_name = 'audit_log';
 
--- 4. Verify security_invoker = true on all 12 public v_* views:
+-- 4. Verify function execution grants (Expected: only has_perm, user_has_branch, is_admin for authenticated; 0 for anon/PUBLIC):
+SELECT routine_name, routine_type, grantee, privilege_type
+FROM information_schema.routine_privileges
+WHERE routine_schema = 'public' AND grantee IN ('anon', 'authenticated', 'PUBLIC')
+ORDER BY routine_name, grantee;
+
+-- 5. Verify security_invoker = true on ALL 12 public v_* views (reloptions must show {security_invoker=true}, not NULL):
 SELECT c.relname AS view_name, c.reloptions
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = 'public' AND c.relkind = 'v' AND c.relname LIKE 'v_%'
 ORDER BY c.relname;
 
--- 5. Verify default privileges revoked for future tables/sequences:
+-- 5b. Verify view access: only 7 v1 views granted to authenticated; 5 later views have 0 grants:
+SELECT table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE table_schema = 'public' AND grantee = 'authenticated' AND table_name LIKE 'v_%'
+ORDER BY table_name;
+
+-- 6. Verify default privileges revoked for future tables, sequences and functions:
 SELECT defaclrole::regrole AS owner_role, nspname AS schema, defaclobjtype AS object_type, defaclacl
 FROM pg_default_acl d
 LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
 WHERE n.nspname = 'public';
 
--- 6. Verify role timeouts on service_role (Postgres 17: transaction_timeout = '60s'):
+-- 7. Verify role timeouts on service_role (Postgres 17: transaction_timeout = '60s') and intact defaults:
 SELECT rolname, rolconfig
 FROM pg_roles
 WHERE rolname IN ('anon', 'authenticated', 'authenticator', 'service_role');
@@ -99,19 +112,31 @@ create policy user_branches_select_own on user_branches
 -- ---------------------------------------------------------------------
 revoke all on all tables in schema public from anon, public;
 revoke all on all sequences in schema public from anon, public;
-revoke all on all routines in schema public from anon, public;
 
 -- Revoke all on all tables from authenticated first to establish clean deny-by-default
 revoke all on all tables in schema public from authenticated;
 revoke all on all sequences in schema public from authenticated;
 
 -- ---------------------------------------------------------------------
--- 4. ALTER DEFAULT PRIVILEGES (Engine-level Deny-by-Default)
--- Ensures any table, sequence or routine created in the future in public
--- does not inherit automatic grants to anon, authenticated or public.
+-- 4. FUNCTION SECURITY: Revoke EXECUTE from anon & PUBLIC; grant only app helpers
+-- Trigger functions execute internally under table context and need no grants.
+-- ---------------------------------------------------------------------
+revoke execute on all functions in schema public from anon, public;
+revoke execute on all functions in schema public from authenticated;
+
+-- Grant EXECUTE to authenticated only for the helper functions required by RLS & app
+grant execute on function has_perm(text, text) to authenticated;
+grant execute on function user_has_branch(uuid) to authenticated;
+grant execute on function is_admin() to authenticated;
+
+-- ---------------------------------------------------------------------
+-- 5. ALTER DEFAULT PRIVILEGES (Engine-level Deny-by-Default)
+-- Ensures any table, sequence or function created in the future in public
+-- does NOT inherit automatic grants to anon, authenticated or public.
 -- ---------------------------------------------------------------------
 alter default privileges in schema public revoke all on tables from anon, authenticated, public;
 alter default privileges in schema public revoke all on sequences from anon, authenticated, public;
+alter default privileges in schema public revoke all on functions from anon, authenticated, public;
 alter default privileges in schema public revoke all on routines from anon, authenticated, public;
 
 do $$
@@ -119,12 +144,13 @@ begin
   if exists (select 1 from pg_roles where rolname = 'postgres') then
     execute 'alter default privileges for role postgres in schema public revoke all on tables from anon, authenticated, public';
     execute 'alter default privileges for role postgres in schema public revoke all on sequences from anon, authenticated, public';
+    execute 'alter default privileges for role postgres in schema public revoke all on functions from anon, authenticated, public';
     execute 'alter default privileges for role postgres in schema public revoke all on routines from anon, authenticated, public';
   end if;
 end $$;
 
 -- ---------------------------------------------------------------------
--- 5. GRANT access to authenticated ONLY for v1 core modules
+-- 6. GRANT access to authenticated ONLY for v1 core modules
 -- (POS, HR, Fixed Assets, Budgets, and ETA are withheld until their phases)
 -- ---------------------------------------------------------------------
 
@@ -195,7 +221,8 @@ grant usage, select on sequence sync_seq to authenticated;
 -- All writes are handled exclusively by the server-side audit_row() trigger.
 grant select on audit_log to authenticated;
 
--- K. Derived Views (v1 reporting)
+-- K. Derived Views (v1 reporting ONLY)
+-- Views for later phases (v_pos_*, v_employee_*, v_budget_*, v_eta_*) receive NO grants in v1.
 grant select on v_stock_balance to authenticated;
 grant select on v_trial_balance to authenticated;
 grant select on v_party_balance to authenticated;
@@ -205,8 +232,8 @@ grant select on v_lot_balance to authenticated;
 grant select on v_installment_status to authenticated;
 
 -- ---------------------------------------------------------------------
--- 6. SET security_invoker = true ON ALL PUBLIC VIEWS
--- Ensures views respect caller RLS policies instead of view definer.
+-- 7. SET security_invoker = true ON ALL 12 PUBLIC VIEWS
+-- Ensures all views respect caller RLS policies instead of view definer.
 -- ---------------------------------------------------------------------
 alter view v_stock_balance set (security_invoker = true);
 alter view v_trial_balance set (security_invoker = true);
@@ -222,19 +249,19 @@ alter view v_budget_vs_actual set (security_invoker = true);
 alter view v_eta_work_queue set (security_invoker = true);
 
 -- ---------------------------------------------------------------------
--- 7. CRITICAL DENIALS (Unreachable by clients):
+-- 8. CRITICAL DENIALS (Unreachable by clients):
 -- - sync_ops: NO GRANTS to authenticated or anon. Edge Function (service_role) only!
--- - POS: pos_terminals, pos_shifts, pos_cash_movements (Phase 8)
+-- - POS: pos_terminals, pos_shifts, pos_cash_movements, v_pos_shift_summary, v_pos_shift_payments (Phase 8)
 -- - HR & Payroll: departments, employees, pay_components, employee_components,
 --                 employee_loans, payroll_tax_brackets, payroll_runs, payslips,
---                 payslip_lines (Phase 9)
+--                 payslip_lines, v_employee_loan_balance (Phase 9)
 -- - Fixed Assets: asset_categories, fixed_assets, depreciation_runs, depreciation_lines (Phase 10)
--- - Budgets: budgets, budget_lines (Phase 7)
--- - ETA: eta_settings, eta_item_codes, eta_submissions (Phase 11)
+-- - Budgets: budgets, budget_lines, v_budget_vs_actual (Phase 7)
+-- - ETA: eta_settings, eta_item_codes, eta_submissions, v_eta_work_queue (Phase 11)
 -- ---------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------
--- 8. Role Timeouts (service_role only for backend/Edge Functions)
+-- 9. Role Timeouts (service_role only for backend/Edge Functions)
 -- anon and authenticated keep their Supabase default timeouts (anon=3s, authenticated=8s).
 -- service_role (Postgres 17.11) is configured with a strict 60s hard ceiling:
 -- ---------------------------------------------------------------------
