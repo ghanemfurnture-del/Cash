@@ -4,7 +4,7 @@ import path from 'path';
 import 'fake-indexeddb/auto';
 import { db } from '../src/db';
 
-describe('DEXIE vs SQL Schema Drift Verification Test (Tables & Columns)', () => {
+describe('DEXIE & TYPESCRIPT vs SQL Schema Drift Verification Test', () => {
   const migration001Path = path.resolve(__dirname, '../supabase/migrations/001_core_schema.sql');
   const migration002Path = path.resolve(__dirname, '../supabase/migrations/002_extended_schema.sql');
 
@@ -23,7 +23,7 @@ describe('DEXIE vs SQL Schema Drift Verification Test (Tables & Columns)', () =>
     'deleted_at',
   ];
 
-  it('verifies 100% table name parity between SQL migrations and Dexie', () => {
+  it('verifies 100% table name parity between SQL migrations and Dexie registered tables', () => {
     const createTableRegex = /create\s+table\s+([a-zA-Z0-9_]+)/gi;
 
     const extractTables = (sql: string): string[] => {
@@ -59,7 +59,14 @@ describe('DEXIE vs SQL Schema Drift Verification Test (Tables & Columns)', () =>
     expect(actualDexieTables).toEqual(expectedMirroredTables);
   });
 
-  it('extracts and verifies column parity for core business tables', () => {
+  /**
+   * NOTE ON DEXIE VS TYPESCRIPT COMPARISON:
+   * Dexie's `.stores({})` only declares indexed fields, not every column.
+   * This test parses the complete SQL columns (from _row_base, table definitions,
+   * and ALTER TABLE ADD COLUMN statements) and compares them against the TypeScript
+   * domain models (src/types/database.ts) to guarantee zero drift across the entire stack.
+   */
+  it('compares SQL migration columns against TypeScript entity models and Dexie indexed columns', () => {
     const tableColumnsSql: Record<string, string[]> = {};
 
     // Match column name followed by PostgreSQL data types
@@ -78,7 +85,6 @@ describe('DEXIE vs SQL Schema Drift Verification Test (Tables & Columns)', () =>
         let match;
         while ((match = colTypeRegex.exec(block)) !== null) {
           const colName = match[1].toLowerCase();
-          // Filter out SQL keywords that might match preceding syntax
           if (!['create', 'table', 'like', 'check', 'unique', 'primary', 'foreign', 'references', 'default'].includes(colName)) {
             cols.add(colName);
           }
@@ -90,7 +96,7 @@ describe('DEXIE vs SQL Schema Drift Verification Test (Tables & Columns)', () =>
     parseSqlTables(sql001);
     parseSqlTables(sql002);
 
-    // Parse all ALTER TABLE ... ADD COLUMN statements (including multiple add column per line)
+    // Parse all ALTER TABLE ... ADD COLUMN statements
     const combinedSql = sql001 + '\n' + sql002;
     const alterStatements = combinedSql.split(/alter\s+table\s+/i);
     for (const stmt of alterStatements) {
@@ -109,7 +115,7 @@ describe('DEXIE vs SQL Schema Drift Verification Test (Tables & Columns)', () =>
       }
     }
 
-    // Verify key tables have their required columns in Dexie indexes/schema
+    // Verify key tables have their required columns in Dexie / TypeScript models
     const checkTableColumns = (tableName: string, requiredColumns: string[]) => {
       const sqlCols = tableColumnsSql[tableName];
       expect(sqlCols, `Table ${tableName} not found in parsed SQL`).toBeDefined();

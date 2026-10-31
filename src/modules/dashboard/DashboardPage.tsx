@@ -14,11 +14,13 @@ import { db } from '../../db';
 
 export const DashboardPage: React.FC = () => {
   const { currentBranch, session } = useAuth();
-  const [activeTableCount, setActiveTableCount] = useState<number>(0);
+  const [businessTableCount, setBusinessTableCount] = useState<number>(0);
 
   useEffect(() => {
-    // Real runtime check of initialized Dexie tables
-    setActiveTableCount(db.tables.length);
+    // Exclude client-only synchronization tables (outbox, sync_meta) to show accurate business tables count
+    const clientInternalTables = ['outbox', 'sync_meta'];
+    const businessTables = db.tables.filter((t) => !clientInternalTables.includes(t.name));
+    setBusinessTableCount(businessTables.length);
   }, []);
 
   return (
@@ -138,9 +140,9 @@ export const DashboardPage: React.FC = () => {
             يعمل النظام محلياً عبر قاعدة بيانات IndexedDB بالمتصفح، مع جاهزية كاملة لحفظ الفواتير والقيود محلياً.
           </p>
           <div className="pt-2 border-t border-border/60 flex items-center justify-between text-xs">
-            <span className="text-muted-foreground">الجداول المحلية المهيأة:</span>
+            <span className="text-muted-foreground">جداول الأعمال المنعكسة محلياً:</span>
             <span className="font-bold text-primary tabular-nums">
-              {activeTableCount > 0 ? `${activeTableCount} جدولاً نشطاً` : 'جارِ الفحص...'}
+              {businessTableCount > 0 ? `${businessTableCount} جدولاً (مستبعداً outbox و sync_meta)` : 'جارِ الفحص...'}
             </span>
           </div>
         </div>
