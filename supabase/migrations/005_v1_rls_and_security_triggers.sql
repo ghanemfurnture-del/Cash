@@ -711,3 +711,4 @@ create policy sync_conflicts_update on sync_conflicts for update using (is_admin
 -- No INSERT/UPDATE/DELETE policies: writes occur exclusively via audit_row() trigger
 drop policy if exists audit_log_select on audit_log;
 create policy audit_log_select on audit_log for select using (is_admin() or has_perm('audit', 'view'));
+
