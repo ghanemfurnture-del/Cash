@@ -489,3 +489,4 @@ create policy accounts_insert on accounts for insert with check (has_perm('accou
 create policy accounts_update on accounts for update using (has_perm('accounting','edit'));
 -- documents: module depends on doc_type (sales_* -> 'sales', purchase_* -> 'purchases').
 -- Devices that are revoked must lose access: check devices.revoked_at in the sync Edge Function.
+

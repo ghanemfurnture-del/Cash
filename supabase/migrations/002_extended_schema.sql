@@ -502,3 +502,4 @@ begin
     execute format('alter table %I enable row level security', t);
   end loop;
 end $$;
+
