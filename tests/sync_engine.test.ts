@@ -315,14 +315,19 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
           success: true,
           status: 'duplicate',
           isDuplicate: true,
+          original_result: 'applied',
+          server_row: serverJournalEntries.get(item.entity_id),
         };
       }
 
-      serverJournalEntries.set(item.entity_id, {
+      const serverRow = {
         id: item.entity_id,
         ...item.payload,
+        version: 1,
+        server_seq: 42,
         created_at: new Date().toISOString(),
-      });
+      };
+      serverJournalEntries.set(item.entity_id, serverRow);
 
       serverSyncOps.set(item.op_id, {
         op_id: item.op_id,
@@ -330,7 +335,7 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
         result: 'applied',
       });
 
-      return { success: true, status: 'applied' };
+      return { success: true, status: 'applied', server_row: serverRow };
     };
 
     const outboxItem: OutboxItem = {
@@ -353,12 +358,16 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
     const firstPush = await SyncEngine.pushOperation(outboxItem, { customExecutor: mockPushExecutor });
     expect(firstPush.success).toBe(true);
     expect(firstPush.isDuplicate).toBeFalsy();
+    expect(firstPush.server_row).toBeDefined();
+    expect(firstPush.server_row.server_seq).toBe(42);
     expect(serverJournalEntries.size).toBe(1);
     expect(serverSyncOps.size).toBe(1);
 
     const secondPush = await SyncEngine.pushOperation(outboxItem, { customExecutor: mockPushExecutor });
     expect(secondPush.success).toBe(true);
     expect(secondPush.isDuplicate).toBe(true);
+    expect(secondPush.server_row).toBeDefined();
+    expect(secondPush.server_row.server_seq).toBe(42);
 
     expect(serverJournalEntries.size).toBe(1);
     expect(serverSyncOps.size).toBe(1);
@@ -529,12 +538,15 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
           success: true,
           status: 'duplicate',
           isDuplicate: true,
+          original_result: 'applied',
+          server_row: { id: opApplied.entity_id, version: 1, server_seq: 100 },
         };
       }
       return {
         success: false,
         status: 'duplicate',
         isDuplicate: true,
+        original_result: 'rejected',
         error: 'Original operation was permanently rejected: check constraint violation',
       };
     };
@@ -542,6 +554,8 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
     const res1 = await SyncEngine.pushOperation(opApplied, { customExecutor: mockDuplicateExecutor });
     expect(res1.success).toBe(true);
     expect(res1.isDuplicate).toBe(true);
+    expect(res1.server_row).toBeDefined();
+    expect(res1.server_row.server_seq).toBe(100);
 
     const res2 = await SyncEngine.pushOperation(opRejected, { customExecutor: mockDuplicateExecutor });
     expect(res2.success).toBe(false);
@@ -664,5 +678,88 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
     expect(storedSyncMeta).toBeDefined();
     // PROOF: Recorded timestamp is strictly the server clock, not local Date()
     expect(storedSyncMeta?.value).toBe(mockPostgresClock);
+  });
+
+  // =========================================================================
+  // Test (j): Client Retry Policy & Poison Pill Containment (Item 7)
+  // Verifies transient errors retry up to 5 times, then transition to 'failed'
+  // =========================================================================
+  it('(j) proves client retry policy: transient error retries up to 5 times before transitioning to failed (poison pill containment)', async () => {
+    const itemId = crypto.randomUUID();
+
+    const queued = await OutboxRepository.queueOperation({
+      entity: 'items',
+      entity_id: itemId,
+      op: 'update',
+      payload: { sale_price: 500 },
+      user_id: 'user-01',
+      base_version: 1,
+    });
+
+    const mockTransientTimeoutExecutor = async (_item: OutboxItem) => {
+      return {
+        success: false,
+        error: 'Transient timeout (57014): statement timeout',
+        errorObj: { code: '57014', message: 'canceling statement due to statement timeout' },
+      };
+    };
+
+    // Attempts 1 to 4: Status remains 'pending', retry_count increments
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const res = await SyncEngine.pushAll({ customExecutor: mockTransientTimeoutExecutor });
+      expect(res.failedCount).toBe(1);
+
+      const opInDb = await db.outbox.get(queued.id);
+      expect(opInDb?.status).toBe('pending');
+      expect(opInDb?.retry_count).toBe(attempt);
+      expect(opInDb?.error).toContain(`attempt ${attempt}/5`);
+    }
+
+    // 5th Attempt: Cap reached -> transitions to 'failed' to prevent infinite loop
+    const fifthPush = await SyncEngine.pushAll({ customExecutor: mockTransientTimeoutExecutor });
+    expect(fifthPush.failedCount).toBe(1);
+
+    const poisonedOp = await db.outbox.get(queued.id);
+    expect(poisonedOp?.status).toBe('failed');
+    expect(poisonedOp?.retry_count).toBe(5);
+    expect(poisonedOp?.error).toContain('Max retries (5) exceeded');
+
+    // Subsequent pushAll ignores this failed operation
+    const subsequentPush = await SyncEngine.pushAll({ customExecutor: mockTransientTimeoutExecutor });
+    expect(subsequentPush.pushedCount).toBe(0);
+    expect(subsequentPush.failedCount).toBe(0);
+  });
+
+  // =========================================================================
+  // Test (k): Immediate Classification of Unexpected SQLSTATEs (Item 7)
+  // Verifies 42xxx errors immediately transition to 'failed' with 0 retries
+  // =========================================================================
+  it('(k) proves unexpected SQLSTATEs (e.g. 42501 / 42703) immediately fail without retry loops', async () => {
+    const itemId = crypto.randomUUID();
+
+    const queued = await OutboxRepository.queueOperation({
+      entity: 'items',
+      entity_id: itemId,
+      op: 'update',
+      payload: { invalid_col: 'value' },
+      user_id: 'user-01',
+      base_version: 1,
+    });
+
+    const mockSqlstateExecutor = async (_item: OutboxItem) => {
+      return {
+        success: false,
+        error: 'column "invalid_col" does not exist',
+        errorObj: { code: '42703', message: 'column "invalid_col" of relation "items" does not exist' },
+      };
+    };
+
+    const res = await SyncEngine.pushAll({ customExecutor: mockSqlstateExecutor });
+    expect(res.failedCount).toBe(1);
+
+    const opInDb = await db.outbox.get(queued.id);
+    // PROOF: Immediately marked as 'failed', not left as 'pending'
+    expect(opInDb?.status).toBe('failed');
+    expect(opInDb?.error).toContain('column "invalid_col" of relation "items" does not exist');
   });
 });

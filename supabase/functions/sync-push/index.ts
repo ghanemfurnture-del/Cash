@@ -8,7 +8,15 @@
 // 1. Direct RPC: Used by the PWA for lowest latency and direct transaction control.
 // 2. Edge Function: Gateway for external devices, POS hardware, ETA signing agent,
 //    and webhook integrations that send raw HTTP JSON and require upfront
-//    schema validation, rate limiting, and HTTP error code translation.
+//    schema validation, payload normalization, and HTTP error code translation.
+//
+// CORS POLICY JUSTIFICATION:
+// Access-Control-Allow-Origin: '*' is acceptable and deliberate here because:
+// - This is an authenticated API gateway where every business operation requires
+//   an explicit Bearer JWT (Authorization: Bearer <caller_jwt>).
+// - Ambient browser credentials (cookies) are NOT used (credentials mode is not 'include').
+// - Clients include mobile PWA apps, desktop browser instances, and local network
+//   POS hardware terminals across varying local IP subnets and origins.
 // =====================================================================
 
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
@@ -70,7 +78,7 @@ serve(async (req) => {
           { status: 422, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
-      if (!header || typeof header !== 'object') {
+      if (!header || typeof header !== 'object' || Array.isArray(header)) {
         return new Response(
           JSON.stringify({ success: false, status: 'rejected', code: 'validation', error: 'Document header must be an object' }),
           { status: 422, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -111,20 +119,24 @@ serve(async (req) => {
           { status: 422, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
-      if (payload === null || typeof payload !== 'object') {
+
+      // Payload normalization: for 'delete' and 'post', payload is optional and defaults to {}
+      const normalizedPayload = payload ?? {};
+      if (typeof normalizedPayload !== 'object' || Array.isArray(normalizedPayload)) {
         return new Response(
           JSON.stringify({ success: false, status: 'rejected', code: 'validation', error: 'Payload must be an object' }),
           { status: 422, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
 
+      // base_version ?? null preserves 0 without converting it to null
       rpcResponse = await userClient.rpc('sync_push_op', {
         p_op_id: op_id,
         p_entity: entity,
         p_entity_id: entity_id,
         p_op: op,
-        p_payload: payload,
-        p_base_version: base_version || null,
+        p_payload: normalizedPayload,
+        p_base_version: base_version ?? null,
         p_client_ts: client_ts || new Date().toISOString(),
       });
     }
@@ -154,7 +166,7 @@ serve(async (req) => {
 
     const result = rpcResponse.data;
 
-    // Permanent Rejections returned as structured 200 with success: false (or 422)
+    // Success and structured business rejections returned as JSON
     return new Response(
       JSON.stringify(result),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }

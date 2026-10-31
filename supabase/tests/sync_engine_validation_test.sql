@@ -51,6 +51,11 @@ DECLARE
   v_op_id_transient uuid := '44444444-4444-4444-4444-444444444411';
   v_idemp_item_id uuid := '55555555-5555-5555-5555-555555555501';
 
+  v_posted_doc_id uuid := '66666666-6666-6666-6666-666666666601';
+  v_posted_line_id uuid := '66666666-6666-6666-6666-666666666602';
+  v_posted_op_id uuid := '77777777-7777-7777-7777-777777777701';
+  v_posted_at timestamptz;
+
   v_res jsonb;
   v_res_dup jsonb;
   v_count int;
@@ -61,6 +66,13 @@ DECLARE
   v_seq_before bigint;
   v_has_priv boolean;
   v_pub_routines_count int;
+
+  v_anon_push_op boolean;
+  v_anon_push_doc boolean;
+  v_anon_server_time boolean;
+  v_auth_push_op boolean;
+  v_auth_push_doc boolean;
+  v_auth_server_time boolean;
 BEGIN
   -- -------------------------------------------------------------------
   -- 0. FIXTURES SETUP
@@ -149,6 +161,25 @@ BEGIN
   end if;
 
   -- -------------------------------------------------------------------
+  -- TEST 1B: Anon Execution Denial on RPCs (Item 1)
+  -- Proves anon cannot execute sync_push_op, sync_push_document, get_server_time
+  -- -------------------------------------------------------------------
+  select has_function_privilege('anon', 'sync_push_op(uuid, text, uuid, text, jsonb, int, timestamptz)', 'execute') into v_anon_push_op;
+  select has_function_privilege('anon', 'sync_push_document(uuid, jsonb, jsonb, boolean, timestamptz)', 'execute') into v_anon_push_doc;
+  select has_function_privilege('anon', 'get_server_time()', 'execute') into v_anon_server_time;
+
+  select has_function_privilege('authenticated', 'sync_push_op(uuid, text, uuid, text, jsonb, int, timestamptz)', 'execute') into v_auth_push_op;
+  select has_function_privilege('authenticated', 'sync_push_document(uuid, jsonb, jsonb, boolean, timestamptz)', 'execute') into v_auth_push_doc;
+  select has_function_privilege('authenticated', 'get_server_time()', 'execute') into v_auth_server_time;
+
+  if v_anon_push_op = false and v_anon_push_doc = false and v_anon_server_time = false
+     and v_auth_push_op = true and v_auth_push_doc = true and v_auth_server_time = true then
+    insert into test_results values (18, 'Anon Function Privilege Revocation Check', 'PASS', 'anon denied execute on sync_push_op, sync_push_document, get_server_time; authenticated granted execute');
+  else
+    insert into test_results values (18, 'Anon Function Privilege Revocation Check', 'FAIL', 'Privilege leak: anon has execute on RPCs');
+  end if;
+
+  -- -------------------------------------------------------------------
   -- TEST 2: Real Postgres RLS Branch Denial (Item 3.ii)
   -- Proves user without branch access CANNOT write (UPDATE or INSERT)
   -- to that branch under real Postgres RLS policies
@@ -232,12 +263,12 @@ BEGIN
   end if;
 
   -- -------------------------------------------------------------------
-  -- TEST 5: Server column tamper stripping and natural version increment
+  -- TEST 5: Server column tamper stripping, natural version increment & server_row returned (Item 2)
   -- -------------------------------------------------------------------
   execute 'set local role authenticated';
   perform set_config('request.jwt.claims', json_build_object('sub', v_admin_uid, 'role', 'authenticated')::text, true);
 
-  -- Read real version before update (Item 13)
+  -- Read real version before update
   select version, server_seq into v_old_version, v_seq_before from items where id = v_item_id;
 
   select sync_push_op(
@@ -259,13 +290,17 @@ BEGIN
   select * into v_item_rec from items where id = v_item_id;
 
   if (v_res ->> 'success')::boolean = true
+     and (v_res ? 'server_row')
+     and (v_res -> 'server_row' ->> 'name_ar') = 'صنف محدث بأمان مع قائمة السماح'
+     and (v_res -> 'server_row' ->> 'version')::int = v_old_version + 1
+     and (v_res -> 'server_row' ->> 'server_seq')::bigint > 0
      and v_item_rec.name_ar = 'صنف محدث بأمان مع قائمة السماح'
      and v_item_rec.server_seq <> 999999
-     and v_item_rec.version = v_old_version + 1 -- strictly asserted as old + 1
+     and v_item_rec.version = v_old_version + 1
      and v_item_rec.deleted_at is null then
-    insert into test_results values (5, 'Column Allowlist & Natural Version Increment', 'PASS', 'Server-controlled columns stripped; version incremented strictly to old_version + 1 (' || v_item_rec.version || ')');
+    insert into test_results values (5, 'Column Allowlist, Natural Version & server_row Shape', 'PASS', 'Server-controlled columns stripped; version incremented strictly to old_version + 1; full server_row returned with version and server_seq');
   else
-    insert into test_results values (5, 'Column Allowlist & Natural Version Increment', 'FAIL', 'Tampering check failed: ' || row_to_json(v_item_rec)::text);
+    insert into test_results values (5, 'Column Allowlist, Natural Version & server_row Shape', 'FAIL', 'Tampering check failed: ' || row_to_json(v_item_rec)::text || ' Res: ' || v_res::text);
   end if;
 
   -- -------------------------------------------------------------------
@@ -322,7 +357,7 @@ BEGIN
   end if;
 
   -- -------------------------------------------------------------------
-  -- TEST 8: Soft Delete sets deleted_at and RLS Visibility (Item 11)
+  -- TEST 8: Soft Delete sets deleted_at and RLS Visibility
   -- -------------------------------------------------------------------
   select version, server_seq into v_old_version, v_seq_before from items where id = v_item_id;
 
@@ -339,8 +374,8 @@ BEGIN
   -- Verify tombstone is visible under RLS for users with access
   select count(*) into v_count from items where id = v_item_id and deleted_at is not null;
 
-  if (v_res ->> 'success')::boolean = true and v_count = 1 then
-    insert into test_results values (8, 'Soft Delete & Tombstone RLS Visibility', 'PASS', 'Row soft-deleted with deleted_at set and confirmed SELECTABLE under RLS as tombstone');
+  if (v_res ->> 'success')::boolean = true and (v_res ? 'server_row') and v_count = 1 then
+    insert into test_results values (8, 'Soft Delete & Tombstone RLS Visibility', 'PASS', 'Row soft-deleted with deleted_at set, returned server_row tombstone, confirmed SELECTABLE under RLS');
   else
     insert into test_results values (8, 'Soft Delete & Tombstone RLS Visibility', 'FAIL', 'Tombstone not visible or delete failed. Count: ' || v_count);
   end if;
@@ -399,9 +434,9 @@ BEGIN
   end if;
 
   -- -------------------------------------------------------------------
-  -- TEST 11: Real Postgres Idempotency (Item 3.i)
+  -- TEST 11: Real Postgres Idempotency & Duplicate server_row Return (Item 2)
   -- Proves executing same op_id twice on real Postgres produces exactly ONE effect:
-  -- Exactly 1 row created in items, exactly 1 row in sync_ops, retry returns duplicate/applied
+  -- Exactly 1 row created in items, exactly 1 row in sync_ops, retry returns original_result=applied AND server_row
   -- -------------------------------------------------------------------
   -- First push
   select sync_push_op(
@@ -430,14 +465,17 @@ BEGIN
   select count(*) into v_count_ops from sync_ops where op_id = v_op_id_9;
 
   if (v_res ->> 'success')::boolean = true
+     and (v_res ? 'server_row')
      and (v_res_dup ->> 'status') = 'duplicate'
      and (v_res_dup ->> 'is_duplicate')::boolean = true
      and (v_res_dup ->> 'original_result') = 'applied'
+     and (v_res_dup ? 'server_row')
+     and (v_res_dup -> 'server_row' ->> 'id') = v_idemp_item_id::text
      and v_count = 1
      and v_count_ops = 1 then
-    insert into test_results values (11, 'Real Postgres Idempotency (Same op_id = One Effect)', 'PASS', 'First push applied; duplicate retry returned original_result=applied; exactly 1 business row and 1 sync_ops row exist');
+    insert into test_results values (11, 'Real Postgres Idempotency & Duplicate server_row Shape', 'PASS', 'First push applied; duplicate retry returned original_result=applied WITH server_row; exactly 1 business row and 1 sync_ops row exist');
   else
-    insert into test_results values (11, 'Real Postgres Idempotency (Same op_id = One Effect)', 'FAIL', 'Idempotency failure: Dup=' || v_res_dup::text || ' items=' || v_count || ' sync_ops=' || v_count_ops);
+    insert into test_results values (11, 'Real Postgres Idempotency & Duplicate server_row Shape', 'FAIL', 'Idempotency failure: Dup=' || v_res_dup::text || ' items=' || v_count || ' sync_ops=' || v_count_ops);
   end if;
 
   -- -------------------------------------------------------------------
@@ -464,7 +502,7 @@ BEGIN
   end if;
 
   -- -------------------------------------------------------------------
-  -- TEST 13: Transient Error Rollback (ADDENDUM a)
+  -- TEST 13: Transient Error Rollback
   -- Proves transient errors (40001/55P03/57014) abort the transaction
   -- and leave ZERO rows in sync_ops (no provisional row committed)
   -- -------------------------------------------------------------------
@@ -488,7 +526,7 @@ BEGIN
   end if;
 
   -- -------------------------------------------------------------------
-  -- TEST 14: Permanent Error sync_ops Finalization (ADDENDUM a)
+  -- TEST 14: Permanent Error sync_ops Finalization
   -- Proves permanent errors finalize result to 'rejected' (never provisional)
   -- -------------------------------------------------------------------
   select result, error into v_sync_op_rec from sync_ops where op_id = v_op_id_1;
@@ -500,7 +538,7 @@ BEGIN
   end if;
 
   -- -------------------------------------------------------------------
-  -- TEST 15: Optimistic Concurrency Conflict Finalization (ADDENDUM b)
+  -- TEST 15: Optimistic Concurrency Conflict Finalization
   -- Proves version mismatch finalizes result to 'conflict' (separate from 'rejected')
   -- -------------------------------------------------------------------
   select result, error into v_sync_op_rec from sync_ops where op_id = v_op_id_5;
@@ -512,7 +550,7 @@ BEGIN
   end if;
 
   -- -------------------------------------------------------------------
-  -- TEST 16: Zero Committed Rows in Provisional State (ADDENDUM a)
+  -- TEST 16: Zero Committed Rows in Provisional State
   -- Global invariant: no committed sync_ops row can have provisional signature
   -- (result = 'conflict' AND error IS NULL)
   -- -------------------------------------------------------------------
@@ -527,7 +565,7 @@ BEGIN
   end if;
 
   -- -------------------------------------------------------------------
-  -- TEST 17: Reversal Operation Explicit Rejection (ADDENDUM c)
+  -- TEST 17: Reversal Operation Explicit Rejection
   -- Proves 'reverse' is recognized in contract and explicitly rejected
   -- explaining Phase 3/5 ledger engine requirements
   -- -------------------------------------------------------------------
@@ -548,6 +586,126 @@ BEGIN
   else
     insert into test_results values (17, 'Accounting Reversal Operation Rejection', 'FAIL', 'Unexpected response for reverse: ' || v_res::text);
   end if;
+
+  -- -------------------------------------------------------------------
+  -- TEST 19: Posted Record Immutability & Re-post Protection (Item 3)
+  -- 1. Create and post document via sync_push_document
+  -- 2. Verify update to posted doc is rejected by trg_block_doc
+  -- 3. Verify delete of child line of posted doc is rejected by trg_block_dl
+  -- 4. Verify second post with different op_id is rejected and posted_at is unchanged
+  -- -------------------------------------------------------------------
+  execute 'set local role authenticated';
+  perform set_config('request.jwt.claims', json_build_object('sub', v_admin_uid, 'role', 'authenticated')::text, true);
+
+  -- 19a. Create and post document
+  select sync_push_document(
+    v_posted_op_id,
+    jsonb_build_object(
+      'id', v_posted_doc_id,
+      'branch_id', v_branch_cai,
+      'doc_type', 'sales_invoice',
+      'series_code', 'PST',
+      'seq_no', 991122,
+      'doc_no', 'INV-POST-IMMUTABLE-01',
+      'doc_date', '2026-01-20',
+      'subtotal', 250,
+      'total', 250
+    ),
+    jsonb_build_array(
+      jsonb_build_object(
+        'id', v_posted_line_id,
+        'line_no', 1,
+        'item_id', v_item_id,
+        'qty', 1,
+        'unit_price', 250,
+        'line_total', 250
+      )
+    ),
+    true, -- post_now = true
+    now()
+  ) into v_res;
+
+  select posted_at into v_posted_at from documents where id = v_posted_doc_id;
+
+  -- 19b. Attempt to update posted document
+  declare
+    v_res_update jsonb;
+    v_res_delete_line jsonb;
+    v_res_repost jsonb;
+    v_posted_at_after timestamptz;
+  begin
+    select sync_push_op(
+      gen_random_uuid(),
+      'documents',
+      v_posted_doc_id,
+      'update',
+      jsonb_build_object('notes', 'محاولة تعديل غير قانونية لمستند مرحل'),
+      1,
+      now()
+    ) into v_res_update;
+
+    -- 19c. Attempt to delete line of posted document
+    select sync_push_op(
+      gen_random_uuid(),
+      'document_lines',
+      v_posted_line_id,
+      'delete',
+      '{}'::jsonb,
+      1,
+      now()
+    ) into v_res_delete_line;
+
+    -- 19d. Attempt to post second time with DIFFERENT op_id
+    select sync_push_op(
+      gen_random_uuid(),
+      'documents',
+      v_posted_doc_id,
+      'post',
+      '{}'::jsonb,
+      1,
+      now()
+    ) into v_res_repost;
+
+    select posted_at into v_posted_at_after from documents where id = v_posted_doc_id;
+
+    if (v_res ->> 'success')::boolean = true
+       and (v_res ? 'server_row')
+       and (v_res ? 'lines')
+       and (v_res_update ->> 'status') = 'rejected'
+       and (v_res_update ->> 'error') like '%posted records are immutable%'
+       and (v_res_delete_line ->> 'status') = 'rejected'
+       and (v_res_delete_line ->> 'error') like '%cannot change lines of a posted record%'
+       and (v_res_repost ->> 'status') = 'rejected'
+       and (v_res_repost ->> 'error') like '%already posted%'
+       and v_posted_at_after = v_posted_at then
+      insert into test_results values (19, 'Posted Document Immutability & Re-Post Rejection', 'PASS', 'Posted doc update blocked by trg_block_doc; line deletion blocked by trg_block_dl; second post with different op_id rejected with posted_at unchanged');
+    else
+      insert into test_results values (19, 'Posted Document Immutability & Re-Post Rejection', 'FAIL', 'Posted check failed: Update=' || v_res_update::text || ' DelLine=' || v_res_delete_line::text || ' RePost=' || v_res_repost::text);
+    end if;
+  end;
+
+  -- -------------------------------------------------------------------
+  -- TEST 20: _internal_finalize_sync_op auth.uid() Enforced Ownership (Item 4)
+  -- Proves finalizing a sync_op that caller does not own raises exception
+  -- -------------------------------------------------------------------
+  declare
+    v_finalize_threw boolean := false;
+  begin
+    begin
+      -- Try to finalize nonexistent or unowned op_id
+      perform private._internal_finalize_sync_op(gen_random_uuid(), 'applied');
+    exception when others then
+      if sqlerrm like '%not found or not owned by user%' then
+        v_finalize_threw := true;
+      end if;
+    end;
+
+    if v_finalize_threw = true then
+      insert into test_results values (20, 'Finalize Sync Op auth.uid() Ownership Check', 'PASS', 'Finalize function strictly validates user_id = auth.uid() and raises exception when 0 rows are updated');
+    else
+      insert into test_results values (20, 'Finalize Sync Op auth.uid() Ownership Check', 'FAIL', 'Failed to raise exception on unowned/missing op_id finalize');
+    end if;
+  end;
 
 END $$;
 
@@ -595,5 +753,5 @@ ROLLBACK;
 --   COMMIT;
 --
 -- SESSION B (Tab 2 - Unblocks automatically upon Session A commit):
---   -- Returns: {"success": true, "status": "duplicate", "is_duplicate": true, "original_result": "applied", "code": "ok"}
+--   -- Returns: {"success": true, "status": "duplicate", "is_duplicate": true, "original_result": "applied", "code": "ok", "server_row": {...}}
 -- =====================================================================

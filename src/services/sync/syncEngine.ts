@@ -5,6 +5,11 @@ import type { OutboxItem, BaseEntity } from '../../types/database';
 import type { Table } from 'dexie';
 
 /**
+ * Maximum retry attempts for transient errors before an outbox item is marked as 'failed' (poison pill containment)
+ */
+export const MAX_RETRY_ATTEMPTS = 5;
+
+/**
  * Sync Configuration Constants (from docs/sync.md)
  */
 export const SYNC_CONFIG = {
@@ -23,6 +28,17 @@ export interface SyncResult {
   pushedCount: number;
   conflictsCount: number;
   errors: string[];
+}
+
+export interface PushOperationResult {
+  success: boolean;
+  isDuplicate?: boolean;
+  status?: string;
+  original_result?: string;
+  error?: string;
+  errorObj?: any;
+  server_row?: any;
+  lines?: any[];
 }
 
 /**
@@ -46,6 +62,73 @@ export const SYNCABLE_V1_TABLES = [
   'fiscal_years',
   'fiscal_periods',
 ] as const;
+
+/**
+ * Classifies whether an error is permanent (non-retryable poison op) or transient (retryable).
+ *
+ * Permanent errors (immediate status 'failed' or 'conflict', no retry):
+ * - Server rejections (status === 'rejected')
+ * - Optimistic concurrency conflicts (status === 'conflict')
+ * - Unexpected SQLSTATEs re-raised by the RPC:
+ *   - 42xxx (Syntax, undefined table/column, schema violation, permission denied 42501)
+ *   - 23xxx (Integrity, check, foreign key, or unique constraint violations)
+ *   - 22xxx (Data exceptions / type conversion)
+ *   - 0Axxx (Feature not supported)
+ *   - P0001 (Business validation triggers like block_posted_changes, block_posted_children)
+ *
+ * Transient errors (retryable with exponential backoff up to MAX_RETRY_ATTEMPTS):
+ * - 57014 (PostgreSQL statement / query timeout)
+ * - 40001 (Serialization failure)
+ * - 55P03 (Lock not available)
+ * - 08xxx (Connection dropped)
+ * - Network errors ("Failed to fetch", "NetworkError", HTTP 503, HTTP 504)
+ */
+export function classifyError(error: any): { isPermanent: boolean; isConflict: boolean; message: string } {
+  if (!error) return { isPermanent: false, isConflict: false, message: 'Unknown error' };
+
+  const message = typeof error === 'string' ? error : (error.message || JSON.stringify(error));
+  const code = (error.code || error.sqlstate || '').toString().toUpperCase();
+
+  // Optimistic concurrency conflict
+  if (error.status === 'conflict' || code === 'CONFLICT' || message.includes('Optimistic concurrency conflict')) {
+    return { isPermanent: true, isConflict: true, message };
+  }
+
+  // Explicit server rejection
+  if (error.status === 'rejected') {
+    return { isPermanent: true, isConflict: false, message };
+  }
+
+  // SQLSTATE classification
+  if (
+    code.startsWith('42') ||
+    code.startsWith('23') ||
+    code.startsWith('22') ||
+    code.startsWith('0A') ||
+    code === 'P0001'
+  ) {
+    return { isPermanent: true, isConflict: false, message };
+  }
+
+  // Known permanent message strings
+  if (
+    message.includes('permission denied') ||
+    message.includes('violates foreign key') ||
+    message.includes('violates check constraint') ||
+    message.includes('violates unique constraint') ||
+    message.includes('is pull-only') ||
+    message.includes('cannot change lines of a posted record') ||
+    message.includes('posted records are immutable') ||
+    message.includes('already posted') ||
+    message.includes('branch access denied') ||
+    message.includes('Operation ID collision')
+  ) {
+    return { isPermanent: true, isConflict: false, message };
+  }
+
+  // Transient / retryable error
+  return { isPermanent: false, isConflict: false, message };
+}
 
 export class SyncEngine {
   /**
@@ -150,7 +233,9 @@ export class SyncEngine {
   }
 
   /**
-   * Commit-safe pull across all v1 tables
+   * Commit-safe pull across all v1 tables.
+   * Calls get_server_time() BEFORE the pull query loop so all concurrent
+   * commits on the server are guaranteed to be captured by the lookback window.
    */
   static async pullAll(options?: {
     serverTimeFn?: () => Promise<string>;
@@ -160,7 +245,7 @@ export class SyncEngine {
     let totalConflicts = 0;
     let highestSeq = 0;
 
-    // Fetch authoritative server timestamp from PostgreSQL server clock
+    // Step 1: Fetch authoritative server timestamp from PostgreSQL server clock BEFORE querying tables
     const serverTimestamp = await this.getServerTime(options?.serverTimeFn);
 
     for (const tableName of SYNCABLE_V1_TABLES) {
@@ -177,7 +262,7 @@ export class SyncEngine {
       }
     }
 
-    // Update global cursor using authoritative server clock timestamp
+    // Step 2: Update global cursor using authoritative server clock timestamp
     await db.sync_meta.put({
       key: 'last_server_seq',
       value: highestSeq,
@@ -197,7 +282,7 @@ export class SyncEngine {
   }
 
   /**
-   * Sync-Push: Pushes pending operations to Supabase
+   * Sync-Push: Pushes pending operations to Supabase.
    * MANDATORY SECURITY RULE: Runs every business operation under caller's JWT, never service_role.
    * Employs op_id for guaranteed idempotency.
    */
@@ -205,15 +290,29 @@ export class SyncEngine {
     item: OutboxItem,
     options?: {
       jwt?: string;
-      customExecutor?: (item: OutboxItem) => Promise<{ success: boolean; isDuplicate?: boolean; error?: string; status?: string }>;
+      customExecutor?: (item: OutboxItem) => Promise<{
+        success: boolean;
+        isDuplicate?: boolean;
+        error?: string;
+        errorObj?: any;
+        status?: string;
+        original_result?: string;
+        server_row?: any;
+        lines?: any[];
+      }>;
     }
-  ): Promise<{ success: boolean; isDuplicate?: boolean; error?: string }> {
+  ): Promise<PushOperationResult> {
     // If a custom executor is injected (for unit tests / mocking)
     if (options?.customExecutor) {
       const res = await options.customExecutor(item);
+      const isDuplicate = Boolean(res.isDuplicate || res.status === 'duplicate');
+      const originalResult = res.original_result || (isDuplicate ? (res.success ? 'applied' : 'rejected') : undefined);
       return {
         ...res,
-        isDuplicate: Boolean(res.isDuplicate || res.status === 'duplicate'),
+        isDuplicate,
+        original_result: originalResult,
+        server_row: res.server_row,
+        lines: res.lines,
       };
     }
 
@@ -221,7 +320,11 @@ export class SyncEngine {
     const { data: sessionData } = await supabase.auth.getSession();
     const token = options?.jwt || sessionData?.session?.access_token;
     if (!token) {
-      throw new Error('Push failed: User is not authenticated (missing JWT token)');
+      return {
+        success: false,
+        error: 'Push failed: User is not authenticated (missing JWT token)',
+        errorObj: { code: '42501', message: 'Missing JWT token' },
+      };
     }
 
     try {
@@ -239,7 +342,7 @@ export class SyncEngine {
           entity_id: item.entity_id,
           op: item.op,
           payload: item.payload,
-          base_version: item.base_version,
+          base_version: item.base_version ?? null,
           client_ts: item.client_ts,
         },
       });
@@ -251,13 +354,52 @@ export class SyncEngine {
       }
 
       responseBody = data;
-      if (responseBody?.status === 'duplicate') {
-        return { success: true, isDuplicate: true };
+
+      if (!responseBody?.success) {
+        if (responseBody?.status === 'duplicate') {
+          return {
+            success: responseBody.original_result === 'applied',
+            isDuplicate: true,
+            status: 'duplicate',
+            original_result: responseBody.original_result,
+            error: responseBody.error,
+            server_row: responseBody.server_row,
+            lines: responseBody.lines,
+          };
+        }
+        return {
+          success: false,
+          status: responseBody?.status || 'rejected',
+          error: responseBody?.error || 'Operation rejected by server',
+          errorObj: responseBody,
+        };
       }
 
-      return { success: true };
+      // Immediate local reconciliation: update version and server_seq to prevent stale base_version on subsequent edits
+      if (responseBody?.server_row && (db as any)[item.entity]) {
+        const table = (db as any)[item.entity] as Table<any, string>;
+        await table.put(responseBody.server_row);
+      }
+      if (responseBody?.lines && Array.isArray(responseBody.lines) && db.document_lines) {
+        for (const line of responseBody.lines) {
+          await db.document_lines.put(line);
+        }
+      }
+
+      return {
+        success: true,
+        isDuplicate: responseBody?.status === 'duplicate',
+        status: responseBody?.status,
+        original_result: responseBody?.original_result,
+        server_row: responseBody?.server_row,
+        lines: responseBody?.lines,
+      };
     } catch (err: any) {
-      return { success: false, error: err.message || String(err) };
+      return {
+        success: false,
+        error: err.message || String(err),
+        errorObj: err,
+      };
     }
   }
 
@@ -265,7 +407,7 @@ export class SyncEngine {
    * Direct user operation execution (calls atomic sync_push_op RPC)
    * Guaranteed to use caller's JWT, enforcing RLS, branch scoping, and atomicity.
    */
-  static async executeDirectUserOperation(item: OutboxItem): Promise<{ success: boolean; isDuplicate?: boolean; error?: string }> {
+  static async executeDirectUserOperation(item: OutboxItem): Promise<PushOperationResult> {
     try {
       const { data, error } = await (supabase.rpc as any)('sync_push_op', {
         p_op_id: item.op_id,
@@ -273,7 +415,7 @@ export class SyncEngine {
         p_entity_id: item.entity_id,
         p_op: item.op,
         p_payload: item.payload,
-        p_base_version: item.base_version || null,
+        p_base_version: item.base_version ?? null,
         p_client_ts: item.client_ts || new Date().toISOString(),
       });
 
@@ -283,14 +425,32 @@ export class SyncEngine {
         return {
           success: false,
           error: isTimeout ? `Transient timeout (57014): ${error.message}` : error.message,
+          errorObj: error,
         };
       }
 
       if (!data?.success) {
         if (data?.status === 'duplicate') {
-          return { success: data.original_result === 'applied', isDuplicate: true, error: data.error };
+          // Reconcile server row on duplicate of applied op
+          if (data.original_result === 'applied' && data.server_row && (db as any)[item.entity]) {
+            const table = (db as any)[item.entity] as Table<any, string>;
+            await table.put(data.server_row);
+          }
+          return {
+            success: data.original_result === 'applied',
+            isDuplicate: true,
+            status: 'duplicate',
+            original_result: data.original_result,
+            error: data.error,
+            server_row: data.server_row,
+          };
         }
-        return { success: false, error: data?.error || 'Operation rejected by server' };
+        return {
+          success: false,
+          status: data?.status || 'rejected',
+          error: data?.error || 'Operation rejected by server',
+          errorObj: data,
+        };
       }
 
       // Immediate local reconciliation: update version and server_seq to prevent stale base_version on subsequent edits
@@ -299,17 +459,38 @@ export class SyncEngine {
         await table.put(data.server_row);
       }
 
-      return { success: true, isDuplicate: data?.status === 'duplicate' };
+      return {
+        success: true,
+        isDuplicate: data?.status === 'duplicate',
+        status: data?.status,
+        original_result: data?.original_result,
+        server_row: data?.server_row,
+      };
     } catch (err: any) {
-      return { success: false, error: err.message || String(err) };
+      return {
+        success: false,
+        error: err.message || String(err),
+        errorObj: err,
+      };
     }
   }
 
   /**
-   * Process all pending outbox operations sequentially
+   * Process all pending outbox operations sequentially with retry policy:
+   * - Permanent failures (rejections, conflicts, 42xxx) marked as 'failed'/'conflict' immediately without retry.
+   * - Transient failures (57014 timeout, network drops) retried with exponential backoff up to MAX_RETRY_ATTEMPTS (5).
+   * - Poison ops exceeding retry cap transition to 'failed' to prevent infinite retry loops.
    */
   static async pushAll(options?: {
-    customExecutor?: (item: OutboxItem) => Promise<{ success: boolean; error?: string; status?: string }>;
+    customExecutor?: (item: OutboxItem) => Promise<{
+      success: boolean;
+      error?: string;
+      errorObj?: any;
+      status?: string;
+      original_result?: string;
+      server_row?: any;
+      lines?: any[];
+    }>;
   }): Promise<{ pushedCount: number; failedCount: number; errors: string[] }> {
     const pendingOps = await OutboxRepository.getPendingOperations();
     if (pendingOps.length === 0) {
@@ -329,10 +510,35 @@ export class SyncEngine {
         await OutboxRepository.markApplied([item.id]);
         pushedCount++;
       } else {
-        const errorMsg = res.error || 'Unknown push error';
-        await OutboxRepository.markFailed(item.id, errorMsg);
-        failedCount++;
-        errors.push(`Operation ${item.id} (${item.entity}) failed: ${errorMsg}`);
+        const classification = classifyError(res.errorObj || res.error);
+
+        if (classification.isPermanent) {
+          // Permanent failure / RLS denial / 42xxx / constraint violation / optimistic conflict
+          await OutboxRepository.markFailed(item.id, classification.message, classification.isConflict);
+          failedCount++;
+          errors.push(`Operation ${item.id} (${item.entity}) permanently failed: ${classification.message}`);
+        } else {
+          // Transient failure (57014 timeout, network, lock conflict)
+          const newRetryCount = (item.retry_count || 0) + 1;
+          if (newRetryCount >= MAX_RETRY_ATTEMPTS) {
+            // Cap exceeded: poison pill containment
+            await OutboxRepository.markFailed(
+              item.id,
+              `Max retries (${MAX_RETRY_ATTEMPTS}) exceeded. Last error: ${classification.message}`
+            );
+            failedCount++;
+            errors.push(`Operation ${item.id} (${item.entity}) exceeded max retries: ${classification.message}`);
+          } else {
+            // Under cap: return to 'pending' with incremented retry count
+            await db.outbox.update(item.id, {
+              status: 'pending',
+              retry_count: newRetryCount,
+              error: `Transient error (attempt ${newRetryCount}/${MAX_RETRY_ATTEMPTS}): ${classification.message}`,
+            });
+            failedCount++;
+            errors.push(`Operation ${item.id} (${item.entity}) transiently failed (attempt ${newRetryCount}/${MAX_RETRY_ATTEMPTS}): ${classification.message}`);
+          }
+        }
       }
     }
 
