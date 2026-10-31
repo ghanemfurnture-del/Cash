@@ -1,14 +1,30 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { WifiOff, AlertTriangle, CloudOff, Info } from 'lucide-react';
+import { WifiOff, AlertTriangle, CheckCircle2, RefreshCw } from 'lucide-react';
 import { OutboxRepository } from '../../db/outbox';
 import { db } from '../../db';
+import { SyncEngine } from '../../services/sync/syncEngine';
 
 export const SyncStatusPill: React.FC = () => {
   const { t } = useTranslation();
   const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [counts, setCounts] = useState({ pending: 0, inFlight: 0, conflict: 0 });
   const [lastSyncTime, setLastSyncTime] = useState<string | null>(null);
+
+  const refreshCounts = async () => {
+    try {
+      const c = await OutboxRepository.getCounts();
+      setCounts(c);
+
+      const lastSync = await db.sync_meta.get('last_sync_timestamp');
+      if (lastSync?.value) {
+        setLastSyncTime(new Date(lastSync.value).toLocaleTimeString('ar-EG'));
+      }
+    } catch (e) {
+      console.error('Error fetching outbox status:', e);
+    }
+  };
 
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
@@ -17,20 +33,8 @@ export const SyncStatusPill: React.FC = () => {
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
 
-    // Poll outbox counts and last sync timestamp every 2 seconds
-    const interval = setInterval(async () => {
-      try {
-        const c = await OutboxRepository.getCounts();
-        setCounts(c);
-
-        const lastSync = await db.sync_meta.get('last_sync_at');
-        if (lastSync?.value) {
-          setLastSyncTime(new Date(lastSync.value).toLocaleTimeString('ar-EG'));
-        }
-      } catch (e) {
-        console.error('Error fetching outbox status:', e);
-      }
-    }, 2000);
+    refreshCounts();
+    const interval = setInterval(refreshCounts, 3000);
 
     return () => {
       window.removeEventListener('online', handleOnline);
@@ -38,6 +42,19 @@ export const SyncStatusPill: React.FC = () => {
       clearInterval(interval);
     };
   }, []);
+
+  const handleManualSync = async () => {
+    if (!isOnline || isSyncing) return;
+    setIsSyncing(true);
+    try {
+      await SyncEngine.syncAll();
+      await refreshCounts();
+    } catch (err) {
+      console.error('Manual sync failed:', err);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
 
   // Offline State
   if (!isOnline) {
@@ -62,7 +79,7 @@ export const SyncStatusPill: React.FC = () => {
     return (
       <div
         className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-rose-50 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300 border border-rose-200 dark:border-rose-800 select-none animate-pulse"
-        title="يوجد تعارض في البيانات بحاجة إلى مراجعة"
+        title="يوجد تعارض في البيانات بحاجة إلى مراجعة في جدول التعارضات"
       >
         <AlertTriangle className="w-3.5 h-3.5" />
         <span>{t('sync.conflicts', { count: counts.conflict })}</span>
@@ -70,25 +87,42 @@ export const SyncStatusPill: React.FC = () => {
     );
   }
 
-  // Honest Online State before Phase 2b Sync Engine
+  // Syncing State
+  if (isSyncing || counts.inFlight > 0) {
+    return (
+      <div
+        className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-sky-50 text-sky-800 dark:bg-sky-950/60 dark:text-sky-300 border border-sky-200 dark:border-sky-800 select-none"
+        title="جاري رفع وتحديث البيانات مع الخادم السحابي..."
+      >
+        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+        <span>{t('sync.syncing')}</span>
+      </div>
+    );
+  }
+
+  // Pending Outbox State
+  if (counts.pending > 0) {
+    return (
+      <button
+        onClick={handleManualSync}
+        className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-amber-50 text-amber-900 dark:bg-amber-950/60 dark:text-amber-200 border border-amber-300 dark:border-amber-700 hover:bg-amber-100 dark:hover:bg-amber-900/50 transition-colors cursor-pointer select-none"
+        title="اضغط لبدء المزامنة الفورية مع السيرفر"
+      >
+        <RefreshCw className="w-3.5 h-3.5 text-amber-600" />
+        <span>{t('sync.pending_count', { count: counts.pending })}</span>
+      </button>
+    );
+  }
+
+  // Fully Synced State
   return (
-    <div
-      className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300 border border-slate-200 dark:border-slate-700 select-none transition-colors"
-      title={
-        lastSyncTime
-          ? `آخر مزامنة ناجحة: ${lastSyncTime}`
-          : 'النظام متصل؛ محرك المزامنة السحابي التلقائي قيد التفعيل في المرحلة 2b'
-      }
+    <button
+      onClick={handleManualSync}
+      className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-emerald-50 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition-colors cursor-pointer select-none"
+      title={lastSyncTime ? `متصل ومزامن (آخر مزامنة: ${lastSyncTime}) - اضغط للمزامنة` : 'متصل ومزامن بالكامل مع السيرفر'}
     >
-      <CloudOff className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
-      <span>متصل (المزامنة غير مفعلة بعد)</span>
-      {counts.pending > 0 ? (
-        <span className="bg-slate-200 dark:bg-slate-700 px-1.5 py-0.2 rounded-full font-bold text-[10px]">
-          {counts.pending} محلي
-        </span>
-      ) : (
-        <Info className="w-3 h-3 text-slate-400" />
-      )}
-    </div>
+      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+      <span>{t('sync.synced')}</span>
+    </button>
   );
 };

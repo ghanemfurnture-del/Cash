@@ -185,8 +185,7 @@ on conflict (name_ar) do nothing;
 insert into tax_codes (code, name, rate, kind)
 values
   ('VAT14', 'ضريبة القيمة المضافة 14%', 0.1400, 'vat'),
-  ('T0', 'إعفاء ضريبي 0%', 0.0000, 'vat'),
-  ('WHT1', 'ضريبة الخصم والتحصيل تحت حساب الضريبة 1%', 0.0100, 'withholding')
+  ('T0', 'إعفاء ضريبي 0%', 0.0000, 'vat')
 on conflict (code) do nothing;
 
 -- ---------------------------------------------------------------------
