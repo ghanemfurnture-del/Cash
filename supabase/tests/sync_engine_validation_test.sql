@@ -6,6 +6,8 @@ BEGIN;
 -- Run directly in Supabase SQL Editor as 'postgres' role.
 -- Entire script runs within a transaction that starts with BEGIN;
 -- and terminates with ROLLBACK;, ensuring zero persistence or side effects.
+--
+-- EXECUTION STATUS: NOT EXECUTED (Drafted for review; to be run by the user)
 -- =====================================================================
 
 CREATE TEMP TABLE test_results (
@@ -34,7 +36,6 @@ DECLARE
   v_item_id uuid := '33333333-3333-3333-3333-333333333301';
   v_alx_je_id uuid := '33333333-3333-3333-3333-333333333302';
   v_cai_je_id uuid := '33333333-3333-3333-3333-333333333303';
-  v_doc_atomic_id uuid := '33333333-3333-3333-3333-333333333304';
   v_doc_fail_id uuid := '33333333-3333-3333-3333-333333333305';
 
   v_op_id_1 uuid := '44444444-4444-4444-4444-444444444401';
@@ -46,17 +47,18 @@ DECLARE
   v_op_id_7 uuid := '44444444-4444-4444-4444-444444444407';
   v_op_id_8 uuid := '44444444-4444-4444-4444-444444444408';
   v_op_id_9 uuid := '44444444-4444-4444-4444-444444444409';
-  v_op_id_10 uuid := '44444444-4444-4444-4444-444444444410';
+  v_op_id_rev uuid := '44444444-4444-4444-4444-444444444410';
+  v_op_id_transient uuid := '44444444-4444-4444-4444-444444444411';
 
   v_res jsonb;
   v_res_dup jsonb;
   v_count int;
   v_item_rec record;
+  v_sync_op_rec record;
   v_old_version int;
-  v_deleted_at timestamptz;
   v_seq_before bigint;
-  v_seq_after bigint;
   v_has_priv boolean;
+  v_pub_routines_count int;
 BEGIN
   -- -------------------------------------------------------------------
   -- 0. FIXTURES SETUP
@@ -126,16 +128,22 @@ BEGIN
   update fiscal_periods set status = 'closed' where start_date = '2026-09-01';
 
   -- -------------------------------------------------------------------
-  -- TEST 1: Private Schema Isolation & Function Privilege Verification
+  -- TEST 1: Private Schema Isolation & Public Non-Exposure Verification
   -- -------------------------------------------------------------------
-  -- Verify that anon and public cannot execute private._internal_claim_sync_op
+  -- 1a. Verify internal functions do NOT exist in public schema (cannot be exposed by PostgREST)
+  select count(*) into v_pub_routines_count
+  from information_schema.routines
+  where routine_schema = 'public'
+    and routine_name in ('_internal_claim_sync_op', '_internal_finalize_sync_op');
+
+  -- 1b. Verify that anon has NO execute privilege on private internal functions
   select has_function_privilege('anon', 'private._internal_claim_sync_op(uuid, text, uuid, text, jsonb, int, timestamptz)', 'execute')
   into v_has_priv;
 
-  if v_has_priv = false then
-    insert into test_results values (1, 'Private Schema Function Privilege Check', 'PASS', 'anon has NO execute privilege on private._internal_claim_sync_op');
+  if v_pub_routines_count = 0 and v_has_priv = false then
+    insert into test_results values (1, 'Private Schema Non-Exposure Check', 'PASS', 'Internal claim/finalize functions NOT present in public schema; anon denied execute in private schema');
   else
-    insert into test_results values (1, 'Private Schema Function Privilege Check', 'FAIL', 'Security violation: anon has execute privilege on internal claim function');
+    insert into test_results values (1, 'Private Schema Non-Exposure Check', 'FAIL', 'Security violation: internal functions found in public schema or anon has execute privilege');
   end if;
 
   -- -------------------------------------------------------------------
@@ -270,10 +278,25 @@ BEGIN
     now()
   ) into v_res;
 
-  if (v_res ->> 'status') = 'conflict' and (v_res ->> 'code') = 'conflict' and (v_res ? 'server_row') then
-    insert into test_results values (7, 'Optimistic Concurrency Conflict with server_row', 'PASS', 'Version mismatch returned status=conflict, code=conflict, and current server_row');
+  -- Duplicate retry of the conflict
+  select sync_push_op(
+    v_op_id_5,
+    'items',
+    v_item_id,
+    'update',
+    jsonb_build_object('sale_price', 190),
+    v_old_version,
+    now()
+  ) into v_res_dup;
+
+  if (v_res ->> 'status') = 'conflict'
+     and (v_res ->> 'code') = 'conflict'
+     and (v_res ? 'server_row')
+     and (v_res_dup ->> 'status') = 'duplicate'
+     and (v_res_dup ->> 'original_result') = 'conflict' then
+    insert into test_results values (7, 'Optimistic Concurrency Conflict & Duplicate Routing', 'PASS', 'Version mismatch returned status=conflict, code=conflict, server_row; retry returned original_result=conflict');
   else
-    insert into test_results values (7, 'Optimistic Concurrency Conflict with server_row', 'FAIL', 'Conflict response invalid: ' || v_res::text);
+    insert into test_results values (7, 'Optimistic Concurrency Conflict & Duplicate Routing', 'FAIL', 'Conflict response invalid: ' || v_res::text || ' Dup: ' || v_res_dup::text);
   end if;
 
   -- -------------------------------------------------------------------
@@ -354,7 +377,7 @@ BEGIN
   end if;
 
   -- -------------------------------------------------------------------
-  -- TEST 11: Idempotency (Duplicate push returns original_result)
+  -- TEST 11: Idempotency (Duplicate push returns original_result applied)
   -- -------------------------------------------------------------------
   -- First push
   select sync_push_op(
@@ -410,8 +433,137 @@ BEGIN
     insert into test_results values (12, 'Caller-Scoped op_id Protection', 'FAIL', 'Cross-user check failed: ' || v_res::text);
   end if;
 
+  -- -------------------------------------------------------------------
+  -- TEST 13: Transient Error Rollback (ADDENDUM a)
+  -- Proves transient errors (40001/55P03/57014) abort the transaction
+  -- and leave ZERO rows in sync_ops (no provisional row committed)
+  -- -------------------------------------------------------------------
+  begin
+    -- Claim in sub-block and trigger simulated serialization/transient abort
+    perform private._internal_claim_sync_op(
+      v_op_id_transient, 'items', v_item_id, 'update', '{}'::jsonb, 1, now()
+    );
+    raise exception 'Simulated transient serialization conflict' using errcode = '40001';
+  exception when sqlstate '40001' then
+    -- Subtransaction rolled back cleanly
+    null;
+  end;
+
+  select count(*) into v_count from sync_ops where op_id = v_op_id_transient;
+
+  if v_count = 0 then
+    insert into test_results values (13, 'Transient Error Rollback Integrity', 'PASS', 'Transient error aborted subtransaction; ZERO rows persisted in sync_ops (no provisional row committed)');
+  else
+    insert into test_results values (13, 'Transient Error Rollback Integrity', 'FAIL', 'Leaked row in sync_ops after transient error abort');
+  end if;
+
+  -- -------------------------------------------------------------------
+  -- TEST 14: Permanent Error sync_ops Finalization (ADDENDUM a)
+  -- Proves permanent errors finalize result to 'rejected' (never provisional)
+  -- -------------------------------------------------------------------
+  select result, error into v_sync_op_rec from sync_ops where op_id = v_op_id_1;
+
+  if v_sync_op_rec.result = 'rejected' and v_sync_op_rec.error is not null then
+    insert into test_results values (14, 'Permanent Error Finalization Integrity', 'PASS', 'Permanent RLS denial recorded result=rejected with descriptive error in sync_ops (not provisional)');
+  else
+    insert into test_results values (14, 'Permanent Error Finalization Integrity', 'FAIL', 'sync_ops state invalid: ' || row_to_json(v_sync_op_rec)::text);
+  end if;
+
+  -- -------------------------------------------------------------------
+  -- TEST 15: Optimistic Concurrency Conflict Finalization (ADDENDUM b)
+  -- Proves version mismatch finalizes result to 'conflict' (separate from 'rejected')
+  -- -------------------------------------------------------------------
+  select result, error into v_sync_op_rec from sync_ops where op_id = v_op_id_5;
+
+  if v_sync_op_rec.result = 'conflict' and v_sync_op_rec.error is not null then
+    insert into test_results values (15, 'Concurrency Conflict Finalization Integrity', 'PASS', 'Version mismatch recorded result=conflict with descriptive error in sync_ops');
+  else
+    insert into test_results values (15, 'Concurrency Conflict Finalization Integrity', 'FAIL', 'sync_ops state invalid: ' || row_to_json(v_sync_op_rec)::text);
+  end if;
+
+  -- -------------------------------------------------------------------
+  -- TEST 16: Zero Committed Rows in Provisional State (ADDENDUM a)
+  -- Global invariant: no committed sync_ops row can have provisional signature
+  -- (result = 'conflict' AND error IS NULL)
+  -- -------------------------------------------------------------------
+  select count(*) into v_count
+  from sync_ops
+  where result = 'conflict' and error is null;
+
+  if v_count = 0 then
+    insert into test_results values (16, 'Zero Lingering Provisional State Invariant', 'PASS', 'Confirmed 0 rows in sync_ops in provisional state (result=conflict with error IS NULL)');
+  else
+    insert into test_results values (16, 'Zero Lingering Provisional State Invariant', 'FAIL', 'Found ' || v_count || ' rows committed in unfinalized provisional state!');
+  end if;
+
+  -- -------------------------------------------------------------------
+  -- TEST 17: Reversal Operation Explicit Rejection (ADDENDUM c)
+  -- Proves 'reverse' is recognized in contract and explicitly rejected
+  -- explaining Phase 3/5 ledger engine requirements
+  -- -------------------------------------------------------------------
+  select sync_push_op(
+    v_op_id_rev,
+    'documents',
+    gen_random_uuid(),
+    'reverse',
+    '{}'::jsonb,
+    1,
+    now()
+  ) into v_res;
+
+  if (v_res ->> 'status') = 'rejected'
+     and (v_res ->> 'code') = 'validation'
+     and (v_res ->> 'error') like '%Accounting reversal requires counter journal entry%' then
+    insert into test_results values (17, 'Accounting Reversal Operation Rejection', 'PASS', 'Operation reverse recognized in contract; explicitly rejected explaining Phase 3/5 counter-entry requirements');
+  else
+    insert into test_results values (17, 'Accounting Reversal Operation Rejection', 'FAIL', 'Unexpected response for reverse: ' || v_res::text);
+  end if;
+
 END $$;
 
 SELECT test_no, test_name, status, details FROM test_results ORDER BY test_no;
 
 ROLLBACK;
+
+-- =====================================================================
+-- MANUAL TWO-SESSION CONCURRENCY TEST (Item 12)
+-- Concurrency between competing sessions cannot be verified in a single
+-- serial DO block. Run the following in TWO separate SQL Editor tabs:
+--
+-- SESSION A (Tab 1):
+--   BEGIN;
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claims', '{"sub":"aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa","role":"authenticated"}', true);
+--   -- Insert/Claim operation without committing yet
+--   SELECT sync_push_op(
+--     '55555555-5555-5555-5555-555555555555',
+--     'items',
+--     '33333333-3333-3333-3333-333333333301',
+--     'update',
+--     '{"sale_price": 220}'::jsonb,
+--     1,
+--     now()
+--   );
+--   -- KEEP TRANSACTION OPEN (Do NOT run COMMIT yet)
+--
+-- SESSION B (Tab 2 - Concurrently):
+--   SET LOCAL ROLE authenticated;
+--   SELECT set_config('request.jwt.claims', '{"sub":"aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa","role":"authenticated"}', true);
+--   -- Try to push the exact same op_id
+--   SELECT sync_push_op(
+--     '55555555-5555-5555-5555-555555555555',
+--     'items',
+--     '33333333-3333-3333-3333-333333333301',
+--     'update',
+--     '{"sale_price": 220}'::jsonb,
+--     1,
+--     now()
+--   );
+--   -- OBSERVATION: Session B blocks on row lock until Session A finishes!
+--
+-- SESSION A (Tab 1):
+--   COMMIT;
+--
+-- SESSION B (Tab 2 - Unblocks automatically upon Session A commit):
+--   -- Returns: {"success": true, "status": "duplicate", "is_duplicate": true, "original_result": "applied", "code": "ok"}
+-- =====================================================================

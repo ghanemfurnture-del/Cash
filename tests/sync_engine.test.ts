@@ -476,4 +476,46 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
     expect(res2.isDuplicate).toBe(true);
     expect(res2.error).toContain('permanently rejected');
   });
+
+  // =========================================================================
+  // Test (g): Server Duplicate Response handling original_result = 'conflict' (ADDENDUM b)
+  // Uses mock customExecutor
+  // =========================================================================
+  it('(g) proves handling of server duplicate response with original_result conflict', async () => {
+    const opConflict: OutboxItem = {
+      id: crypto.randomUUID(),
+      op_id: crypto.randomUUID(),
+      user_id: 'user-01',
+      entity: 'items',
+      entity_id: crypto.randomUUID(),
+      op: 'update',
+      payload: { sale_price: 300 },
+      base_version: 1,
+      client_ts: new Date().toISOString(),
+      schema_version: 1,
+      status: 'pending',
+      retry_count: 0,
+      error: null,
+    };
+
+    const mockConflictDuplicateExecutor = async (_item: OutboxItem) => {
+      return {
+        success: false,
+        status: 'duplicate',
+        isDuplicate: true,
+        original_result: 'conflict',
+        code: 'conflict',
+        error: 'Optimistic concurrency conflict: server version has changed',
+      };
+    };
+
+    const res = await SyncEngine.pushOperation(opConflict, {
+      customExecutor: mockConflictDuplicateExecutor,
+    });
+
+    expect(res.success).toBe(false);
+    expect(res.isDuplicate).toBe(true);
+    expect(res.original_result).toBe('conflict');
+    expect(res.error).toContain('concurrency conflict');
+  });
 });

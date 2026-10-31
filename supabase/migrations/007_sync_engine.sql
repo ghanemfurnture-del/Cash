@@ -26,9 +26,24 @@ grant usage on schema private to authenticated;
 
 -- A. Atomic Claim of op_id:
 -- Uses auth.uid() directly (no p_user_id parameter to prevent spoofing).
--- Uses INSERT ... ON CONFLICT (op_id) DO NOTHING to eliminate race conditions.
--- Valid result values in 001 check constraint: 'applied', 'duplicate', 'conflict', 'rejected'.
--- During initial claim, result is NULL (unfinalized in this transaction).
+-- Uses INSERT ... ON CONFLICT (op_id) DO NOTHING RETURNING id to eliminate race conditions.
+--
+-- Contractual constraints quoted directly from 001_core_schema.sql:
+-- Line 286: op text not null check (op in ('insert','update','delete','post','reverse')),
+-- Line 289: result text check (result in ('applied','duplicate','conflict','rejected')),
+--
+-- Chosen provisional result: 'conflict'.
+-- Rationale:
+-- 1. 'applied' cannot be used because the op has not executed yet and cannot falsely report success.
+-- 2. 'duplicate' is a response-only status and is never stored in sync_ops.
+-- 3. 'rejected' denotes terminal failure.
+-- 4. 'conflict' is allowed by the CHECK constraint and represents contention/in-flight validation.
+--
+-- Protection against lingering provisional states:
+-- Within this same transaction, the op is finalized to 'applied', 'conflict' (with explicit error message),
+-- or 'rejected'. If any unhandled or transient error occurs (40001, 55P03, 57xxx), the exception
+-- is re-raised and the entire transaction rolls back, undoing the INSERT completely so ZERO rows
+-- are committed in the provisional state.
 create or replace function private._internal_claim_sync_op(
   p_op_id uuid,
   p_entity text,
@@ -50,29 +65,37 @@ set search_path = public, private
 as $$
 declare
   v_caller_uid uuid := auth.uid();
+  v_claimed_id uuid;
   v_rec record;
 begin
   if v_caller_uid is null then
     raise exception 'Unauthorized: caller must be authenticated' using errcode = '42501';
   end if;
 
-  -- 1. Atomic claim attempt (result is NULL initially)
+  -- 1. Atomic claim attempt using RETURNING id
   insert into sync_ops (
     op_id, user_id, entity, entity_id, op, payload,
     base_version, client_ts, schema_version, result, error
   ) values (
     p_op_id, v_caller_uid, p_entity, p_entity_id, p_op, p_payload,
-    p_base_version, coalesce(p_client_ts, now()), 1, null, null
+    p_base_version, coalesce(p_client_ts, now()), 1, 'conflict', null
   )
-  on conflict (op_id) do nothing;
+  on conflict (op_id) do nothing
+  returning id into v_claimed_id;
 
-  -- 2. Inspect record
+  -- 2. If row was returned, this transaction successfully claimed ownership!
+  if v_claimed_id is not null then
+    return query select true, null::text, null::text, false;
+    return;
+  end if;
+
+  -- 3. Row already exists: inspect previous execution
   select user_id, result, error into v_rec
   from sync_ops
   where op_id = p_op_id;
 
   if not found then
-    raise exception 'Critical error: sync_ops record not found after claim';
+    raise exception 'Critical error: sync_ops record not found after claim conflict';
   end if;
 
   -- Check if owned by another user (caller-scoped duplicate check)
@@ -81,13 +104,9 @@ begin
     return;
   end if;
 
-  -- If result is NULL, this transaction claimed it!
-  if v_rec.result is null then
-    return query select true, null::text, null::text, false;
-  else
-    -- Already completed in a prior transaction (applied or rejected)
-    return query select false, v_rec.result, v_rec.error, false;
-  end if;
+  -- Already completed by same user in a prior transaction
+  -- existing_result is one of 'applied', 'rejected', 'conflict'
+  return query select false, v_rec.result, v_rec.error, false;
 end;
 $$;
 
@@ -164,8 +183,8 @@ begin
     raise exception 'Unauthorized: caller must be authenticated' using errcode = '42501';
   end if;
 
-  -- 1. Operation Validation
-  if p_op not in ('insert', 'update', 'delete', 'post') then
+  -- 1. Operation Validation (contract allows 'insert','update','delete','post','reverse')
+  if p_op not in ('insert', 'update', 'delete', 'post', 'reverse') then
     return jsonb_build_object(
       'success', false,
       'status', 'rejected',
@@ -183,7 +202,7 @@ begin
       'error', 'Entity ' || p_entity || ' is pull-only in v1'
     );
   elsif p_entity in ('documents', 'journal_entries', 'payments') then
-    if p_op not in ('insert', 'update', 'post') then
+    if p_op not in ('insert', 'update', 'post', 'reverse') then
       return jsonb_build_object(
         'success', false,
         'status', 'rejected',
@@ -239,8 +258,28 @@ begin
       'status', 'duplicate',
       'is_duplicate', true,
       'original_result', v_claim.existing_result,
-      'code', case when v_claim.existing_result = 'applied' then 'ok' else 'constraint' end,
+      'code', case
+        when v_claim.existing_result = 'applied' then 'ok'
+        when v_claim.existing_result = 'conflict' then 'conflict'
+        else 'constraint'
+      end,
       'error', v_claim.existing_error
+    );
+  end if;
+
+  -- Handle 'reverse' op (ADDENDUM c: contract valid op, explicit rejection explaining Phase 3/5 ledger engine)
+  if p_op = 'reverse' then
+    perform private._internal_finalize_sync_op(
+      p_op_id,
+      'rejected',
+      'Accounting reversal requires counter journal entry generation and credit-note series, scheduled for Phase 3 (Core Ledger) and Phase 5 (Sales & Purchases Returns).'
+    );
+    return jsonb_build_object(
+      'success', false,
+      'status', 'rejected',
+      'code', 'validation',
+      'op_id', p_op_id,
+      'error', 'Accounting reversal requires counter journal entry generation and credit-note series, scheduled for Phase 3 (Core Ledger) and Phase 5 (Sales & Purchases Returns). Status flipping is prohibited.'
     );
   end if;
 
@@ -335,7 +374,7 @@ begin
 
       -- Optimistic Concurrency Check
       if p_base_version is not null and v_current_row.version <> p_base_version then
-        perform private._internal_finalize_sync_op(p_op_id, 'rejected', 'Optimistic concurrency conflict');
+        perform private._internal_finalize_sync_op(p_op_id, 'conflict', 'Optimistic concurrency conflict: server version has changed');
         return jsonb_build_object(
           'success', false,
           'status', 'conflict',
@@ -373,7 +412,7 @@ begin
       end if;
 
       if p_base_version is not null and v_current_row.version <> p_base_version then
-        perform private._internal_finalize_sync_op(p_op_id, 'rejected', 'Optimistic concurrency conflict');
+        perform private._internal_finalize_sync_op(p_op_id, 'conflict', 'Optimistic concurrency conflict on delete');
         return jsonb_build_object(
           'success', false,
           'status', 'conflict',
@@ -403,7 +442,7 @@ begin
       end if;
 
       if p_base_version is not null and v_current_row.version <> p_base_version then
-        perform private._internal_finalize_sync_op(p_op_id, 'rejected', 'Optimistic concurrency conflict');
+        perform private._internal_finalize_sync_op(p_op_id, 'conflict', 'Optimistic concurrency conflict on post');
         return jsonb_build_object(
           'success', false,
           'status', 'conflict',
@@ -520,7 +559,11 @@ begin
       'status', 'duplicate',
       'is_duplicate', true,
       'original_result', v_claim.existing_result,
-      'code', case when v_claim.existing_result = 'applied' then 'ok' else 'constraint' end,
+      'code', case
+        when v_claim.existing_result = 'applied' then 'ok'
+        when v_claim.existing_result = 'conflict' then 'conflict'
+        else 'constraint'
+      end,
       'error', v_claim.existing_error
     );
   end if;

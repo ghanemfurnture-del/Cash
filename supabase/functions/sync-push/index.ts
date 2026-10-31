@@ -105,9 +105,9 @@ serve(async (req) => {
           { status: 422, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
-      if (!['insert', 'update', 'delete', 'post'].includes(op)) {
+      if (!['insert', 'update', 'delete', 'post', 'reverse'].includes(op)) {
         return new Response(
-          JSON.stringify({ success: false, status: 'rejected', code: 'validation', error: 'Invalid op. Allowed: insert, update, delete, post' }),
+          JSON.stringify({ success: false, status: 'rejected', code: 'validation', error: 'Invalid op. Allowed: insert, update, delete, post, reverse' }),
           { status: 422, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
