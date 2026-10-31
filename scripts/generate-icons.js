@@ -108,3 +108,4 @@ fs.writeFileSync(path.join(publicDir, 'vite.svg'), svgIcon);
 fs.writeFileSync(path.join(publicDir, 'masked-icon.svg'), svgIcon);
 
 console.log('Public PWA icons generated successfully in public/');
+
