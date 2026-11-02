@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
@@ -93,6 +94,14 @@ export default defineConfig({
   },
   server: {
     port: 3000,
+  },
+  test: {
+    environment: 'node',
+    env: {
+      VITE_SUPABASE_URL: 'http://127.0.0.1:1',
+      VITE_SUPABASE_ANON_KEY: 'test-dummy-anon-key-isolated-from-network',
+      VITE_ENABLE_DEV_MOCK_AUTH: 'false',
+    },
   },
 });
 

@@ -282,6 +282,43 @@ export class SyncEngine {
   }
 
   /**
+   * Refuses to build a document bundle without header.id (or with an invalid UUID),
+   * failing the operation as a permanent client error.
+   */
+  static buildDocumentBundle(params: {
+    op_id?: string;
+    header: Record<string, any>;
+    lines?: Record<string, any>[];
+    post_now?: boolean;
+    client_ts?: string;
+  }): {
+    op_id: string;
+    header: Record<string, any>;
+    lines: Record<string, any>[];
+    post_now: boolean;
+    client_ts: string;
+  } {
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const headerId = params?.header?.id;
+
+    if (!headerId || typeof headerId !== 'string' || !UUID_REGEX.test(headerId)) {
+      const error: any = new Error('Document bundle refused: header.id is missing or not a valid UUID');
+      error.code = '22000';
+      error.status = 'rejected';
+      error.isPermanent = true;
+      throw error;
+    }
+
+    return {
+      op_id: params.op_id || crypto.randomUUID(),
+      header: params.header,
+      lines: params.lines || [],
+      post_now: Boolean(params.post_now),
+      client_ts: params.client_ts || new Date().toISOString(),
+    };
+  }
+
+  /**
    * Sync-Push: Pushes pending operations to Supabase.
    * MANDATORY SECURITY RULE: Runs every business operation under caller's JWT, never service_role.
    * Employs op_id for guaranteed idempotency.
@@ -302,11 +339,43 @@ export class SyncEngine {
       }>;
     }
   ): Promise<PushOperationResult> {
+    // Client-side invariant: refuse document bundle without valid header.id as permanent client error
+    if (item.entity === 'documents' && (item.payload?.is_bundle || item.payload?.header)) {
+      try {
+        this.buildDocumentBundle({
+          op_id: item.op_id,
+          header: item.payload.header,
+          lines: item.payload.lines,
+          post_now: item.payload.post_now,
+          client_ts: item.client_ts,
+        });
+      } catch (err: any) {
+        return {
+          success: false,
+          status: 'rejected',
+          error: err.message,
+          errorObj: { code: '22000', status: 'rejected', message: err.message, isPermanent: true },
+        };
+      }
+    }
+
     // If a custom executor is injected (for unit tests / mocking)
     if (options?.customExecutor) {
       const res = await options.customExecutor(item);
       const isDuplicate = Boolean(res.isDuplicate || res.status === 'duplicate');
       const originalResult = res.original_result || (isDuplicate ? (res.success ? 'applied' : 'rejected') : undefined);
+
+      // Immediate local reconciliation for customExecutor
+      if (res.success && res.server_row && (db as any)[item.entity]) {
+        const table = (db as any)[item.entity] as Table<any, string>;
+        await table.put(res.server_row);
+      }
+      if (res.success && res.lines && Array.isArray(res.lines) && db.document_lines) {
+        for (const line of res.lines) {
+          await db.document_lines.put(line);
+        }
+      }
+
       return {
         ...res,
         isDuplicate,
@@ -332,19 +401,32 @@ export class SyncEngine {
       let responseBody: any = null;
 
       // Primary path: sync-push Edge Function with caller Bearer token
+      const isDocBundle = item.entity === 'documents' && item.payload?.is_bundle;
+      const requestBody = isDocBundle
+        ? {
+            document_bundle: {
+              op_id: item.op_id,
+              header: item.payload.header,
+              lines: item.payload.lines || [],
+              post_now: Boolean(item.payload.post_now),
+              client_ts: item.client_ts,
+            },
+          }
+        : {
+            op_id: item.op_id,
+            entity: item.entity,
+            entity_id: item.entity_id,
+            op: item.op,
+            payload: item.payload,
+            base_version: item.base_version ?? null,
+            client_ts: item.client_ts,
+          };
+
       const { data, error } = await supabase.functions.invoke('sync-push', {
         headers: {
           Authorization: `Bearer ${token}`,
         },
-        body: {
-          op_id: item.op_id,
-          entity: item.entity,
-          entity_id: item.entity_id,
-          op: item.op,
-          payload: item.payload,
-          base_version: item.base_version ?? null,
-          client_ts: item.client_ts,
-        },
+        body: requestBody,
       });
 
       if (error) {
@@ -409,6 +491,71 @@ export class SyncEngine {
    */
   static async executeDirectUserOperation(item: OutboxItem): Promise<PushOperationResult> {
     try {
+      if (item.entity === 'documents' && item.payload?.is_bundle) {
+        const { data, error } = await (supabase.rpc as any)('sync_push_document', {
+          p_op_id: item.op_id,
+          p_header: item.payload.header,
+          p_lines: item.payload.lines || [],
+          p_post_now: Boolean(item.payload.post_now),
+          p_client_ts: item.client_ts || new Date().toISOString(),
+        });
+
+        if (error) {
+          const isTimeout = error.code === '57014' || error.message?.includes('timeout') || error.message?.includes('canceling statement due to statement timeout');
+          return {
+            success: false,
+            error: isTimeout ? `Transient timeout (57014): ${error.message}` : error.message,
+            errorObj: error,
+          };
+        }
+
+        if (!data?.success) {
+          if (data?.status === 'duplicate') {
+            if (data.original_result === 'applied' && data.server_row && db.documents) {
+              await db.documents.put(data.server_row);
+            }
+            if (data.original_result === 'applied' && Array.isArray(data.lines) && db.document_lines) {
+              for (const line of data.lines) {
+                await db.document_lines.put(line);
+              }
+            }
+            return {
+              success: data.original_result === 'applied',
+              isDuplicate: true,
+              status: 'duplicate',
+              original_result: data.original_result,
+              error: data.error,
+              server_row: data.server_row,
+              lines: data.lines,
+            };
+          }
+          return {
+            success: false,
+            status: data?.status || 'rejected',
+            error: data?.error || 'Document bundle rejected by server',
+            errorObj: data,
+          };
+        }
+
+        if (data?.server_row && db.documents) {
+          await db.documents.put(data.server_row);
+        }
+        if (Array.isArray(data?.lines) && db.document_lines) {
+          for (const line of data.lines) {
+            await db.document_lines.put(line);
+          }
+        }
+
+        return {
+          success: true,
+          isDuplicate: data?.status === 'duplicate',
+          status: data?.status,
+          original_result: data?.original_result,
+          server_row: data?.server_row,
+          lines: data?.lines,
+        };
+      }
+
       const { data, error } = await (supabase.rpc as any)('sync_push_op', {
         p_op_id: item.op_id,
         p_entity: item.entity,

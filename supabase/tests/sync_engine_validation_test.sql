@@ -790,7 +790,10 @@ BEGIN
     v_res_update jsonb;
     v_res_delete_line jsonb;
     v_res_repost jsonb;
-    v_posted_at_after timestamptz;
+    v_res_stale jsonb;
+    v_doc_ver int;
+    v_line_ver int;
+    v_doc_row_after record;
   BEGIN
     EXECUTE 'SET LOCAL ROLE authenticated';
     PERFORM set_config('request.jwt.claims', json_build_object('sub', v_admin_uid, 'role', 'authenticated')::text, true);
@@ -823,61 +826,81 @@ BEGIN
       now()
     ) into v_res;
 
+    -- Read current versions & posted_at as privileged role
     EXECUTE 'RESET ROLE';
-    select posted_at into v_posted_at from documents where id = v_posted_doc_id;
+    select version, posted_at into v_doc_ver, v_posted_at from documents where id = v_posted_doc_id;
+    select version into v_line_ver from document_lines where id = v_posted_line_id;
 
     EXECUTE 'SET LOCAL ROLE authenticated';
     PERFORM set_config('request.jwt.claims', json_build_object('sub', v_admin_uid, 'role', 'authenticated')::text, true);
 
-    -- 20b. Attempt to update posted document
+    -- 20b. Attempt to update posted document with current base_version (must trigger P0001 trg_block_doc)
     select sync_push_op(
       gen_random_uuid(),
       'documents',
       v_posted_doc_id,
       'update',
       jsonb_build_object('notes', 'محاولة تعديل غير قانونية لمستند مرحل'),
-      1,
+      v_doc_ver,
       now()
     ) into v_res_update;
 
-    -- 20c. Attempt to delete line of posted document
+    -- 20c. Attempt to delete line of posted document with current base_version (must trigger P0001 trg_block_dl)
     select sync_push_op(
       gen_random_uuid(),
       'document_lines',
       v_posted_line_id,
       'delete',
       '{}'::jsonb,
-      1,
+      v_line_ver,
       now()
     ) into v_res_delete_line;
 
-    -- 20d. Attempt to post second time with DIFFERENT op_id
+    -- 20d. Attempt to post second time with DIFFERENT op_id with current base_version (must reject already posted)
     select sync_push_op(
       gen_random_uuid(),
       'documents',
       v_posted_doc_id,
       'post',
       '{}'::jsonb,
-      1,
+      v_doc_ver,
       now()
     ) into v_res_repost;
 
+    -- 20e. Attempt to update posted document with STALE base_version (v_doc_ver - 1) -> status 'conflict'
+    select sync_push_op(
+      gen_random_uuid(),
+      'documents',
+      v_posted_doc_id,
+      'update',
+      jsonb_build_object('notes', 'تعديل بنسخة قديمة لمستند مرحل'),
+      v_doc_ver - 1,
+      now()
+    ) into v_res_stale;
+
+    -- Verify final DB state as privileged role
     EXECUTE 'RESET ROLE';
-    select posted_at into v_posted_at_after from documents where id = v_posted_doc_id;
+    select * into v_doc_row_after from documents where id = v_posted_doc_id;
 
     if (v_res ->> 'success')::boolean = true
        and (v_res ? 'server_row')
        and (v_res ? 'lines')
        and (v_res_update ->> 'status') = 'rejected'
        and (v_res_update ->> 'error') like '%posted records are immutable%'
+       and (v_res_update ->> 'sqlstate') = 'P0001'
        and (v_res_delete_line ->> 'status') = 'rejected'
        and (v_res_delete_line ->> 'error') like '%cannot change lines of a posted record%'
        and (v_res_repost ->> 'status') = 'rejected'
        and (v_res_repost ->> 'error') like '%already posted%'
-       and v_posted_at_after = v_posted_at then
-      insert into test_results values (20, 'Posted Document Immutability & Re-Post Rejection', 'PASS', 'Posted doc update blocked by trg_block_doc; line deletion blocked by trg_block_dl; second post with different op_id rejected with posted_at unchanged');
+       and (v_res_stale ->> 'status') = 'conflict'
+       and (v_res_stale ->> 'code') = 'conflict'
+       and (v_res_stale ? 'server_row')
+       and v_doc_row_after.notes is null
+       and v_doc_row_after.version = v_doc_ver
+       and v_doc_row_after.posted_at = v_posted_at then
+      insert into test_results values (20, 'Posted Document Immutability & Re-Post Rejection', 'PASS', 'Posted doc update blocked by trg_block_doc (P0001); line deletion blocked by trg_block_dl; second post with different op_id rejected; stale update returns conflict; doc row unchanged (notes NULL, version/posted_at intact)');
     else
-      insert into test_results values (20, 'Posted Document Immutability & Re-Post Rejection', 'FAIL', 'Posted check failed: Update=' || v_res_update::text || ' DelLine=' || v_res_delete_line::text || ' RePost=' || v_res_repost::text);
+      insert into test_results values (20, 'Posted Document Immutability & Re-Post Rejection', 'FAIL', 'Posted check failed: Update=' || v_res_update::text || ' DelLine=' || v_res_delete_line::text || ' RePost=' || v_res_repost::text || ' Stale=' || v_res_stale::text || ' DocNotes=' || coalesce(v_doc_row_after.notes, 'NULL'));
     end if;
   EXCEPTION WHEN OTHERS THEN
     EXECUTE 'RESET ROLE';

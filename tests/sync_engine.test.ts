@@ -1,5 +1,25 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import 'fake-indexeddb/auto';
+
+// Complete test suite network isolation: guarantees zero HTTP requests to Supabase project
+vi.mock('../src/lib/supabase', () => ({
+  IS_DEV_MOCK_AUTH_ENABLED: false,
+  supabase: {
+    from: vi.fn().mockReturnValue({
+      select: vi.fn().mockReturnValue({
+        gt: vi.fn().mockResolvedValue({ data: [], error: null }),
+      }),
+    }),
+    rpc: vi.fn().mockResolvedValue({ data: new Date().toISOString(), error: null }),
+    auth: {
+      getSession: vi.fn().mockResolvedValue({ data: { session: null }, error: null }),
+    },
+    functions: {
+      invoke: vi.fn().mockRejectedValue(new Error('Network calls blocked in test suite')),
+    },
+  },
+}));
+
 import { db } from '../src/db';
 import { OutboxRepository } from '../src/db/outbox';
 import { SyncEngine } from '../src/services/sync/syncEngine';
@@ -9,6 +29,8 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
   beforeEach(async () => {
     await db.items.clear();
     await db.journal_entries.clear();
+    await db.documents.clear();
+    await db.document_lines.clear();
     await db.outbox.clear();
     await db.sync_conflicts.clear();
     await db.sync_meta.clear();
@@ -761,5 +783,171 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
     // PROOF: Immediately marked as 'failed', not left as 'pending'
     expect(opInDb?.status).toBe('failed');
     expect(opInDb?.error).toContain('column "invalid_col" of relation "items" does not exist');
+  });
+
+  // =========================================================================
+  // Test (l): Document Bundle Header ID Enforcement (Permanent Client Error)
+  // Refuses to build a document bundle without header.id (or with invalid UUID),
+  // and proves pushOperation/pushAll marks the op as 'failed' permanently with 0 retries.
+  // =========================================================================
+  it('(l) proves SyncEngine refuses document bundles without valid header.id and marks them failed permanently', async () => {
+    // 1. Direct call to buildDocumentBundle without header.id throws permanent error
+    expect(() => {
+      SyncEngine.buildDocumentBundle({
+        header: { doc_type: 'sales_invoice', total: 500 }, // missing id
+        lines: [{ line_no: 1, qty: 1, unit_price: 500, line_total: 500 }],
+      });
+    }).toThrow('Document bundle refused: header.id is missing or not a valid UUID');
+
+    // 2. Direct call with invalid non-UUID header.id throws permanent error
+    expect(() => {
+      SyncEngine.buildDocumentBundle({
+        header: { id: 'invalid-non-uuid-string', doc_type: 'sales_invoice' },
+      });
+    }).toThrow('Document bundle refused: header.id is missing or not a valid UUID');
+
+    // 3. Direct call with valid UUID header.id succeeds
+    const validDocId = crypto.randomUUID();
+    const validBundle = SyncEngine.buildDocumentBundle({
+      header: { id: validDocId, doc_type: 'sales_invoice', total: 200 },
+      lines: [{ line_no: 1, qty: 1, unit_price: 200, line_total: 200 }],
+      post_now: true,
+    });
+    expect(validBundle.header.id).toBe(validDocId);
+    expect(validBundle.lines).toHaveLength(1);
+    expect(validBundle.post_now).toBe(true);
+
+    // 4. Queued outbox item with invalid bundle payload fails permanently in pushOperation/pushAll
+    const badBundleOp = await OutboxRepository.queueOperation({
+      entity: 'documents',
+      entity_id: 'bad-doc-uuid',
+      op: 'insert',
+      payload: {
+        is_bundle: true,
+        header: { doc_type: 'sales_invoice' }, // missing id
+        lines: [],
+      },
+      user_id: 'user-01',
+    });
+
+    const res = await SyncEngine.pushAll();
+    expect(res.failedCount).toBe(1);
+
+    const poisonedOp = await db.outbox.get(badBundleOp.id);
+    expect(poisonedOp?.status).toBe('failed');
+    expect(poisonedOp?.error).toContain('Document bundle refused: header.id is missing or not a valid UUID');
+    expect(poisonedOp?.retry_count).toBe(1); // Fails on first attempt without entering retry loop!
+  });
+
+  // =========================================================================
+  // Test (m): Document Bundle Send & Reconciliation SUCCESS Path (customExecutor)
+  // Proves valid document bundle sends successfully, preserves header/lines,
+  // and reconciles authoritative server_row and lines into Dexie db.documents and db.document_lines.
+  // =========================================================================
+  it('(m) proves document bundle send path succeeds and reconciles header and lines into local Dexie store', async () => {
+    const docId = crypto.randomUUID();
+    const lineId = crypto.randomUUID();
+    const branchId = crypto.randomUUID();
+
+    const bundle = SyncEngine.buildDocumentBundle({
+      header: {
+        id: docId,
+        branch_id: branchId,
+        doc_type: 'sales_invoice',
+        series_code: 'POS01',
+        seq_no: 101,
+        doc_no: 'INV-POS01-000101',
+        doc_date: '2026-11-02',
+        subtotal: 500,
+        total: 500,
+      },
+      lines: [
+        {
+          id: lineId,
+          document_id: docId,
+          line_no: 1,
+          qty: 2,
+          unit_price: 250,
+          line_total: 500,
+        },
+      ],
+      post_now: true,
+    });
+
+    const queued = await OutboxRepository.queueOperation({
+      entity: 'documents',
+      entity_id: docId,
+      op: 'post',
+      payload: {
+        is_bundle: true,
+        header: bundle.header,
+        lines: bundle.lines,
+        post_now: bundle.post_now,
+      },
+      user_id: 'cashier-user-uuid',
+    });
+
+    const mockDocumentBundleExecutor = async (item: OutboxItem) => {
+      // Assert received payload adheres to atomic bundle contract
+      expect(item.entity).toBe('documents');
+      expect(item.payload.is_bundle).toBe(true);
+      expect(item.payload.header.id).toBe(docId);
+      expect(item.payload.lines).toHaveLength(1);
+
+      // Return simulated authoritative server response from sync_push_document
+      return {
+        success: true,
+        status: 'applied',
+        code: 'ok',
+        server_row: {
+          ...item.payload.header,
+          status: 'posted',
+          posted_at: '2026-11-02T10:00:00.000Z',
+          version: 2,
+          server_seq: 150,
+          created_at: '2026-11-02T10:00:00.000Z',
+          updated_at: '2026-11-02T10:00:00.000Z',
+        },
+        lines: [
+          {
+            ...item.payload.lines[0],
+            version: 1,
+            server_seq: 151,
+            created_at: '2026-11-02T10:00:00.000Z',
+            updated_at: '2026-11-02T10:00:00.000Z',
+          },
+        ],
+      };
+    };
+
+    const pushRes = await SyncEngine.pushOperation(queued, {
+      customExecutor: mockDocumentBundleExecutor,
+    });
+
+    // 1. Assert push response
+    expect(pushRes.success).toBe(true);
+    expect(pushRes.status).toBe('applied');
+    expect(pushRes.server_row?.version).toBe(2);
+    expect(pushRes.server_row?.status).toBe('posted');
+    expect(pushRes.lines).toHaveLength(1);
+
+    // 2. Assert local IndexedDB (Dexie) reconciliation
+    const docInDb = await db.documents.get(docId);
+    expect(docInDb).toBeDefined();
+    expect(docInDb?.id).toBe(docId);
+    expect(docInDb?.status).toBe('posted');
+    expect(docInDb?.version).toBe(2);
+    expect(docInDb?.server_seq).toBe(150);
+
+    const lineInDb = await db.document_lines.get(lineId);
+    expect(lineInDb).toBeDefined();
+    expect(lineInDb?.id).toBe(lineId);
+    expect(lineInDb?.document_id).toBe(docId);
+    expect(lineInDb?.server_seq).toBe(151);
+
+    // 3. Mark applied in outbox and verify it is cleaned up from pending outbox
+    await OutboxRepository.markApplied([queued.id]);
+    const opInDb = await db.outbox.get(queued.id);
+    expect(opInDb).toBeUndefined();
   });
 });

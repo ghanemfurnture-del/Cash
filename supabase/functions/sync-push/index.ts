@@ -84,6 +84,12 @@ serve(async (req) => {
           { status: 422, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
+      if (!header.id || typeof header.id !== 'string' || !UUID_REGEX.test(header.id)) {
+        return new Response(
+          JSON.stringify({ success: false, status: 'rejected', code: 'validation', error: 'Missing or invalid header.id UUID' }),
+          { status: 422, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
 
       rpcResponse = await userClient.rpc('sync_push_document', {
         p_op_id: op_id,

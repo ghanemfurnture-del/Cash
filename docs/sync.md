@@ -157,6 +157,10 @@ LIMIT 500;
        ]
      }
      ```
+   - **عقد المعرف للعميل غير المتصل (Client-Side Header ID Contract & Retry Guarantees):**
+     - في معمارية Dexie غير المتصلة (Offline-First)، يقوم العميل **دائماً وبشكل إلزامي** بتوليد معرف المستند `header.id` بصيغة UUIDv4 محلياً قبل وضعه في صندوق الصادر (`outbox`). هذا الإلزام تفرضه الطبيعة العلائقية لقاعدة البيانات المحلية؛ حيث ترتبط البنود التابعة برأس المستند محلياً (`document_lines.document_id = doc.id`) قبل أي اتصال بالسيرفر.
+     - في دالة `sync_push_document`: إذا خلا رأس المستند مستقبلاً من المعرف وتم توليد معرف عشوائي بالخادم، فإن إعادة محاولة الإرسال بنفس `op_id` ستولد معرفاً عشوائياً مختلفاً، مما يجعل استعلام `select * from documents where id = v_doc_id` يعود بـ `null`.
+     - لذلك، يلتزم العميل بتمرير `header.id` دائماً. وفي هجرة المرحلة القادمة (Phase 3)، سيتم فرض منع تمرير رأس بدون معرف برفع استثناء صريح (`if v_doc_id is null then raise exception 'Document header id is required' using errcode = '22000';`)، مع دعم استرجاع `entity_id` المخزن في `sync_ops` في فرع التكرار الحيادي (`select entity_id into v_doc_id from sync_ops where op_id = p_op_id;`).
 
 ### ج. عدم قابلية تعديل المستندات المرحلة وحماية الترحيل (Posting Invariants):
 1. **آلية عملية الترحيل (`op = 'post'`):**
@@ -279,3 +283,37 @@ LIMIT 500;
 1. المستند بحالة `draft` يمكن تعديل بياناته الرأسية، أو تعديل/حذف/إضافة بنود في `document_lines`.
 2. يتم إرسال تعديل المسودة وبنودها معاً عبر `sync_push_document` مع مطابقة `base_version` للرأس.
 3. بمجرد تحول المستند إلى `posted`، يمنع مشغل `block_posted_changes` و `block_posted_children` أي تعديل على الرأس أو البنود قطعياً.
+
+---
+
+## 8. القيود المعروفة والتصحيحات المطلوبة في الهجرة القادمة (Known Limitations & Required Fixes in Next Migration)
+
+### المعالجة المجدولة لهجرة المرحلة القادمة: الهجرة `008` (`008_core_ledger_and_sync_enhancements.sql`)
+نظراً لتطبيق الهجرة `007` بالفعل على قاعدة بيانات التطوير والحظر الصارم لتعديلها أثناء المرحلة 2b-2، تم توثيق وتأجيل التحسينات التالية على الدالة `sync_push_document` لتُطبق صراحة في **الهجرة `008`** (أول هجرة في المرحلة 3):
+
+1. **التحقق الصارم من معرف رأس المستند (`header.id`):**
+   - **الوضع الحالي في 007:** إذا خلا `p_header` من `id`، تولد الدالة `v_doc_id := gen_random_uuid()` وتخزنه في `sync_ops`. وفي حال إعادة المحاولة بنفس `op_id`، يُولد UUID جديد مختلف فيفشل استرجاع السطر ويرجع `server_row: null`.
+   - **الحل المُطبق حالياً (Client & Gateway):**
+     - في العميل (`SyncEngine.buildDocumentBundle` و `pushOperation`)، يتم رفض بناء أو إرسال أي حزمة مستند بدون `header.id` كخطأ دائم `code: '22000'` / `status: 'rejected'`.
+     - في دالة الـ Edge Function (`supabase/functions/sync-push/index.ts`)، يتم فحص وتأكيد وجود `header.id` وصحة صيغة الـ UUIDv4 والرد بـ HTTP 422 و `code: 'validation'`.
+   - **المطلوب في الهجرة `008`:** فرض هذا الفحص برمجياً داخل دالة الـ RPC بقاعدة البيانات:
+     ```sql
+     if v_doc_id is null then
+       raise exception 'Document header id is required' using errcode = '22000';
+     end if;
+     ```
+
+2. **قراءة `entity_id` من `sync_ops` عند إعادة المحاولة المكررة (Duplicate Retries):**
+   - **المطلوب في الهجرة `008`:** في فرع التكرار الحيادي (`if not v_claim.is_claimed and v_claim.existing_result = 'applied'`)، قراءة المعرف المعتمد من `sync_ops` مباشرة:
+     ```sql
+     select entity_id into v_doc_id from sync_ops where op_id = p_op_id;
+     ```
+     مما يضمن استرجاع السطر الأصلي حتى لو تم استدعاء الـ RPC بشكل مستقل دون تمرير `p_header.id` في المحاولة الثانية.
+
+3. **غياب اختبار مسار النجاح الفعلي لحزم المستندات (Untested Real Send Path for Document Bundles):**
+   - المسار الفعلي لإرسال حزم المستندات (سواء عبر استدعاء Edge Function `sync-push` أو مسار التفويض البديل المباشر `executeDirectUserOperation` نحو دالة الـ RPC `sync_push_document`) لا يمتلك اختبار وحدة فعلي لمسار النجاح؛ حيث يقتصر الاختبار `(m)` في Vitest على مسار الحقن المخصص `customExecutor`.
+   - **الالتزام:** يجب تغطية واختبار هذا المسار الفعلي كأولوية أولى فور بدء المرحلة 2b-3.
+
+4. **حالة نشر وتشغيل دالة الـ Edge Function (`sync-push` على بيئة Deno):**
+   - دالة الـ Edge Function (`supabase/functions/sync-push/index.ts`) لم يتم نشرها بعد على بيئة Supabase الحية ولم تُشغَّل تجريبياً على بيئة Deno.
+   - بالتالي، فإن التحقق المسبق من صحة `header.id` والاستجابة بـ HTTP 422 ورمز `validation` لم يتم اختبار سلوكهما عملياً وقت التشغيل (Runtime).

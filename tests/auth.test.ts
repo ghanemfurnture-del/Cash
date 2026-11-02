@@ -1,9 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { IS_DEV_MOCK_AUTH_ENABLED } from '../src/lib/supabase';
+import { IS_DEV_MOCK_AUTH_ENABLED, supabase } from '../src/lib/supabase';
 
 describe('Authentication & Profile Authorization (003 RLS Contract)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it('guarantees test environment is strictly isolated from live Supabase project', () => {
+    expect(supabase.supabaseUrl).toBe('http://127.0.0.1:1');
+    expect(supabase.supabaseUrl).not.toContain('supabase.co');
   });
 
   it('ensures dev mock auth flag is disabled by default in production/standard mode', () => {
