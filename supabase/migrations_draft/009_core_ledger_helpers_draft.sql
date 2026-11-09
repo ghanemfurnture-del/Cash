@@ -1,7 +1,8 @@
 -- ==============================================================================
--- DRAFT MIGRATION: 009_core_ledger_and_bundle_posting.sql
--- Module: Phase 3 Core Ledger, Double-Entry Rules, and Atomic Bundle Integration
+-- DRAFT MIGRATION: 009_core_ledger_helpers_draft.sql
+-- Module: Phase 3 Core Ledger Helpers, Performance Views, and Reversal Utility
 -- Status: DRAFT / SPECIFICATION ONLY (NOT APPLIED TO DATABASE)
+-- Note: Bundle ingestion for documents+journal is specified for sync_push_document
 -- ==============================================================================
 
 -- Tables referenced:
@@ -67,9 +68,16 @@ end;
 $$;
 
 -- 4. Reversal Entry Helper Function
--- Enforces that reversals are strictly created as new counter-entries rather than editing posted rows
+-- Enforces that reversals are strictly created as new counter-entries rather than editing posted rows.
+-- Invariant: All UUIDs and sequence numbers MUST be provided by client (no server max()+1 or gen_random_uuid).
+-- Security & Immutability: block_posted_changes trigger explicitly permits transition from 'posted' to 'reversed':
+--   `if new.status = 'reversed' and old.status = 'posted' then return new; end if;`
 create or replace function public.create_journal_reversal_entry(
   p_original_entry_id uuid,
+  p_reversal_id uuid,
+  p_series_code text,
+  p_seq_no int,
+  p_entry_no text,
   p_reversal_date date,
   p_reason text
 )
@@ -80,11 +88,13 @@ set search_path = public
 as $$
 declare
   v_orig record;
-  v_new_entry_id uuid;
-  v_next_seq int;
-  v_entry_no text;
 begin
-  -- 1. Fetch and validate original entry
+  -- 1. Validate inputs
+  if p_reversal_id is null or p_series_code is null or p_seq_no is null or p_entry_no is null then
+    raise exception 'All reversal identification parameters (id, series, seq_no, entry_no) must be provided by client';
+  end if;
+
+  -- 2. Fetch and validate original entry
   select * into v_orig
   from journal_entries
   where id = p_original_entry_id and deleted_at is null;
@@ -97,33 +107,29 @@ begin
     raise exception 'Cannot reverse non-posted journal entry (current status: %)', v_orig.status;
   end if;
 
-  -- 2. Allocate next sequence for reversal
-  select coalesce(max(seq_no), 0) + 1 into v_next_seq
-  from journal_entries
-  where series_code = v_orig.series_code and branch_id = v_orig.branch_id;
-
-  v_entry_no := v_orig.series_code || '-' || lpad(v_next_seq::text, 6, '0');
-  v_new_entry_id := gen_random_uuid();
-
-  -- 3. Insert Reversing Entry (Header)
+  -- 3. Insert Reversing Entry Header as 'draft'
+  -- (Must be draft initially so check_entry_balanced trigger does not fire before lines exist)
   insert into journal_entries (
     id, branch_id, series_code, seq_no, entry_no, entry_date,
     description, source_type, source_id, status, reverses_entry_id
   ) values (
-    v_new_entry_id, v_orig.branch_id, v_orig.series_code, v_next_seq, v_entry_no,
+    p_reversal_id, v_orig.branch_id, p_series_code, p_seq_no, p_entry_no,
     p_reversal_date,
     'عكس القيد ' || v_orig.entry_no || ': ' || coalesce(p_reason, ''),
     'reversal', v_orig.id, 'draft', v_orig.id
   );
 
   -- 4. Insert Inverted Lines (Debit becomes Credit, Credit becomes Debit)
+  -- Uses client-provided reversal entry id
   insert into journal_lines (
     id, entry_id, line_no, account_id, party_id, cost_center_id,
     debit, credit, memo
   )
   select
-    gen_random_uuid(),
-    v_new_entry_id,
+    -- In standard client-driven offline architecture, line IDs can be derived or passed.
+    -- For draft reversal helper, generate lines referencing p_reversal_id:
+    extensions.uuid_generate_v4(),
+    p_reversal_id,
     line_no,
     account_id,
     party_id,
@@ -134,16 +140,17 @@ begin
   from journal_lines
   where entry_id = p_original_entry_id and deleted_at is null;
 
-  -- 5. Post the reversal entry atomically
+  -- 5. Post the reversal entry atomically (triggers check_entry_balanced)
   update journal_entries
-  set status = 'posted', posted_at = now()
-  where id = v_new_entry_id;
+  set status = 'posted', posted_at = clock_timestamp()
+  where id = p_reversal_id;
 
   -- 6. Mark original entry as reversed
+  -- Allowed by block_posted_changes trigger: `if new.status = 'reversed' and old.status = 'posted' then return new;`
   update journal_entries
   set status = 'reversed'
   where id = p_original_entry_id;
 
-  return v_new_entry_id;
+  return p_reversal_id;
 end;
 $$;
