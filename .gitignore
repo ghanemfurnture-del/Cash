@@ -38,9 +38,15 @@ coverage
 # Certificates and keys
 *.pem
 *.key
+*.pfx
+*.p12
+*.jks
 
 # Backups and encrypted dumps
 backups/
+backups_archive/
+scripts/backups_archive/
+scripts/logs/
 *.enc
 *.sql.enc
 *.dump
