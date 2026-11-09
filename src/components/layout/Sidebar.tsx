@@ -17,6 +17,7 @@ import {
   Settings,
   ShieldAlert,
   DatabaseBackup,
+  AlertTriangle,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { useAuth } from '../../core/auth';
@@ -61,6 +62,7 @@ const navSections: { titleKey?: string; items: NavItem[] }[] = [
       { to: '/budgets', labelKey: 'nav.budgets', icon: PieChart, module: 'budgets', comingSoon: true },
       { to: '/audit', labelKey: 'nav.audit', icon: ShieldAlert, module: 'audit' },
       { to: '/backup', labelKey: 'nav.backup', icon: DatabaseBackup, module: 'backup' },
+      { to: '/sync-conflicts', labelKey: 'nav.conflicts', icon: AlertTriangle, module: 'sync' },
       { to: '/settings', labelKey: 'nav.settings', icon: Settings, module: 'settings' },
     ],
   },

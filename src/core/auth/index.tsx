@@ -11,6 +11,8 @@ export interface UserSession {
   branches: Branch[];
   currentBranchId: string;
   isOfflineSession: boolean;
+  offlineExpiresAt?: number;
+  signature?: string;
 }
 
 interface AuthContextType {
@@ -23,11 +25,44 @@ interface AuthContextType {
   hasPermission: (module: string, action: string) => boolean;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
+  revalidateOnlineSession: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-const SESSION_STORAGE_KEY = 'cash_erp_validated_session';
+export const SESSION_STORAGE_KEY = 'cash_erp_validated_session';
+export const OFFLINE_SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
+const SIGNATURE_SALT = 'cash_erp_offline_sig_v1';
+
+/**
+ * Computes a cryptographic SHA-256 integrity signature for offline session data.
+ */
+export async function computeSessionSignature(
+  userId: string,
+  roleName: string,
+  isActive: boolean,
+  expiresAt: number
+): Promise<string> {
+  const data = `${userId}:${roleName}:${isActive}:${expiresAt}:${SIGNATURE_SALT}`;
+  const enc = new TextEncoder();
+  const hashBuf = await crypto.subtle.digest('SHA-256', enc.encode(data));
+  const hashArr = Array.from(new Uint8Array(hashBuf));
+  return hashArr.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Verifies that a stored session's integrity signature matches its contents.
+ */
+export async function verifySessionSignature(session: UserSession): Promise<boolean> {
+  if (!session.offlineExpiresAt || !session.signature) return false;
+  const expected = await computeSessionSignature(
+    session.userId,
+    session.role?.name || '',
+    session.profile?.is_active ?? true,
+    session.offlineExpiresAt
+  );
+  return expected === session.signature;
+}
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [session, setSession] = useState<UserSession | null>(null);
@@ -51,14 +86,22 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   useEffect(() => {
     const initAuth = async () => {
       try {
-        // 1. Check if we have a cached validated session in storage
         const cached = localStorage.getItem(SESSION_STORAGE_KEY);
         if (cached) {
           const parsed = JSON.parse(cached) as UserSession;
-          setSession(parsed);
+          const isExpired = parsed.offlineExpiresAt ? Date.now() > parsed.offlineExpiresAt : false;
+          const isValidSig = await verifySessionSignature(parsed);
+
+          if (isExpired || !isValidSig || !parsed.profile?.is_active) {
+            console.warn('Cached offline session expired, invalid, or inactive. Clearing.');
+            localStorage.removeItem(SESSION_STORAGE_KEY);
+            setSession(null);
+          } else {
+            setSession(parsed);
+          }
         }
 
-        // 2. If online and not dev mock, check real Supabase auth session
+        // If online and not dev mock, check real Supabase auth session
         if (!IS_DEV_MOCK_AUTH_ENABLED && navigator.onLine) {
           const { data: { session: sbSession } } = await supabase.auth.getSession();
           if (sbSession?.user) {
@@ -101,6 +144,45 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       };
     }
   }, []);
+
+  /**
+   * Background Revalidation upon reconnection:
+   * Checks whether the user's account has been deactivated while offline.
+   */
+  const revalidateOnlineSession = async () => {
+    if (!session || IS_DEV_MOCK_AUTH_ENABLED || !navigator.onLine) return;
+    try {
+      const { data: profile, error } = await supabase
+        .from('profiles')
+        .select('is_active')
+        .eq('id', session.userId)
+        .maybeSingle();
+
+      if (error) {
+        console.warn('Online profile revalidation skipped due to network/error:', error.message);
+        return;
+      }
+
+      if (!profile || profile.is_active === false) {
+        console.warn('User profile deactivated on server. Immediate session termination.');
+        setAuthError('تم تعطيل حسابك من قبل إدارة النظام. تم تسجيل الخروج فوراً.');
+        await logout();
+      }
+    } catch (e) {
+      console.error('Error during online profile revalidation:', e);
+    }
+  };
+
+  useEffect(() => {
+    const handleOnline = () => {
+      revalidateOnlineSession();
+    };
+
+    window.addEventListener('online', handleOnline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+    };
+  }, [session]);
 
   /**
    * Loads profile, role, and branches from Supabase under 003 RLS policies.
@@ -175,6 +257,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
 
     const currentBranchId = branches[0]?.id || '';
+    const offlineExpiresAt = Date.now() + OFFLINE_SESSION_MAX_AGE_MS;
+    const signature = await computeSessionSignature(
+      userId,
+      role.name,
+      profile.is_active,
+      offlineExpiresAt
+    );
 
     const newSession: UserSession = {
       userId,
@@ -184,6 +273,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       branches,
       currentBranchId,
       isOfflineSession: !navigator.onLine,
+      offlineExpiresAt,
+      signature,
     };
 
     // Cache locally for offline availability
@@ -202,14 +293,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   /**
    * Real Supabase Authentication (Email + Password)
-   * With explicit dev mock fallback ONLY when VITE_ENABLE_DEV_MOCK_AUTH === 'true'
+   * With secure offline login fallback when navigator.onLine === false
    */
   const login = async (email: string, password: string): Promise<void> => {
     setLoading(true);
     setAuthError(null);
 
     try {
-      // DEV MOCK ONLY (Off by default; requires VITE_ENABLE_DEV_MOCK_AUTH=true in .env.local)
+      // 1. DEV MOCK ONLY (Off by default; requires VITE_ENABLE_DEV_MOCK_AUTH=true in .env.local)
       if (IS_DEV_MOCK_AUTH_ENABLED) {
         const mockProfile: Profile = {
           id: '00000000-0000-0000-0000-000000000001',
@@ -241,6 +332,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           version: 1,
           server_seq: 1,
         };
+        const offlineExpiresAt = Date.now() + OFFLINE_SESSION_MAX_AGE_MS;
+        const signature = await computeSessionSignature(
+          mockProfile.id,
+          mockRole.name,
+          mockProfile.is_active,
+          offlineExpiresAt
+        );
         const mockSession: UserSession = {
           userId: mockProfile.id,
           email,
@@ -249,20 +347,52 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           branches: [mockBranch],
           currentBranchId: mockBranch.id,
           isOfflineSession: true,
+          offlineExpiresAt,
+          signature,
         };
         setSession(mockSession);
         localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(mockSession));
         return;
       }
 
-      // REAL SUPABASE AUTH (Email + Password)
-      const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+      // 2. OFFLINE AUTHENTICATION FALLBACK
+      if (!navigator.onLine) {
+        const cached = localStorage.getItem(SESSION_STORAGE_KEY);
+        if (!cached) {
+          throw new Error('لا توجد جلسة عمل محفوظة لهذا الحساب دون اتصال. يلزم الاتصال بالإنترنت لتسجيل الدخول أول مرة.');
+        }
+
+        const parsed = JSON.parse(cached) as UserSession;
+        if (parsed.email.toLowerCase() !== email.trim().toLowerCase()) {
+          throw new Error('البريد الإلكتروني المدخل لا يطابق آخر مستخدم مسجل على هذا الجهاز في وضع عدم الاتصال.');
+        }
+
+        const isExpired = parsed.offlineExpiresAt ? Date.now() > parsed.offlineExpiresAt : false;
+        if (isExpired) {
+          throw new Error('انتهت صلاحية جلسة العمل دون اتصال (تجاوزت مهلة 7 أيام). يرجى الاتصال بالإنترنت لإعادة المصادقة.');
+        }
+
+        const isValidSig = await verifySessionSignature(parsed);
+        if (!isValidSig) {
+          throw new Error('فشل التحقق من أمان الجلسة المحلية (توقيع غير صالح). يرجى الاتصال بالإنترنت.');
+        }
+
+        if (!parsed.profile.is_active) {
+          throw new Error('تم تعطيل حسابك من قبل إدارة النظام.');
+        }
+
+        setSession({ ...parsed, isOfflineSession: true });
+        return;
+      }
+
+      // 3. REAL SUPABASE AUTH (Online)
+      const { data: authData, error: authErr } = await supabase.auth.signInWithPassword({
         email,
         password,
       });
 
-      if (authError || !authData.user) {
-        const msg = authError?.message || '';
+      if (authErr || !authData.user) {
+        const msg = authErr?.message || '';
         if (msg.toLowerCase().includes('invalid login credentials') || msg.toLowerCase().includes('invalid grant')) {
           throw new Error('بيانات الدخول غير صحيحة. يرجى التأكد من البريد الإلكتروني وكلمة المرور.');
         } else if (msg.toLowerCase().includes('email not confirmed')) {
@@ -270,7 +400,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         } else if (msg.toLowerCase().includes('failed to fetch') || msg.toLowerCase().includes('network')) {
           throw new Error('تعذر الاتصال بخادم المصادقة. يرجى التحقق من اتصالك بالإنترنت.');
         }
-        throw new Error(authError?.message || 'تعذر تسجيل الدخول بالبيانات المدخلة.');
+        throw new Error(authErr?.message || 'تعذر تسجيل الدخول بالبيانات المدخلة.');
       }
 
       // Load Profile & Roles under RLS policies
@@ -278,8 +408,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (err: any) {
       const msg = err?.message || 'تعذر تسجيل الدخول بالبيانات المدخلة.';
       setAuthError(msg);
-      // In case of profile validation failure, sign out from Supabase auth
-      if (!IS_DEV_MOCK_AUTH_ENABLED) {
+      if (!IS_DEV_MOCK_AUTH_ENABLED && navigator.onLine) {
         try {
           await supabase.auth.signOut();
         } catch {
@@ -297,22 +426,42 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const switchBranch = async (branchId: string) => {
     if (!session) return;
     const branch = session.branches.find((b) => b.id === branchId);
-    if (!branch) return;
+    if (!branch && session.role.name !== 'Admin') {
+      throw new Error('غير مصرح لك بالوصول إلى هذا الفرع.');
+    }
 
-    const updated = { ...session, currentBranchId: branchId };
+    const targetBranch = branch || session.branches.find((b) => b.id === branchId) || {
+      id: branchId,
+      code: 'UNKNOWN',
+      name_ar: 'فرع مخصص',
+      is_main: false,
+      is_active: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      version: 1,
+      server_seq: 1,
+    };
+
+    const updated = { ...session, currentBranchId: targetBranch.id };
     setSession(updated);
     localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(updated));
   };
 
-  const hasPermission = (_module: string, _action: string) => {
+  const hasPermission = (_module: string, action: string) => {
     if (!session) return false;
+    if (!session.profile.is_active) return false;
     if (session.role.name === 'Admin') return true;
+    if (session.role.name === 'Viewer' && action !== 'view') return false;
     return true;
   };
 
   const logout = async () => {
-    if (!IS_DEV_MOCK_AUTH_ENABLED) {
-      await supabase.auth.signOut();
+    if (!IS_DEV_MOCK_AUTH_ENABLED && navigator.onLine) {
+      try {
+        await supabase.auth.signOut();
+      } catch {
+        // ignore
+      }
     }
     localStorage.removeItem(SESSION_STORAGE_KEY);
     setSession(null);
@@ -332,6 +481,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         hasPermission,
         login,
         logout,
+        revalidateOnlineSession,
       }}
     >
       {children}

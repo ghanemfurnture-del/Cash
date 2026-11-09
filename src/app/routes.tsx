@@ -1,6 +1,8 @@
 import { createBrowserRouter } from 'react-router-dom';
 import { AppLayout } from '../components/layout/AppLayout';
 import { DashboardPage } from '../modules/dashboard/DashboardPage';
+import { BackupPage } from '../modules/backup/BackupPage';
+import { SyncConflictsPage } from '../modules/sync/SyncConflictsPage';
 import { ModulePlaceholder } from '../components/common/ModulePlaceholder';
 import {
   ShoppingCart,
@@ -16,7 +18,6 @@ import {
   FileSpreadsheet,
   Settings,
   ShieldAlert,
-  DatabaseBackup,
 } from 'lucide-react';
 
 export const router = createBrowserRouter([
@@ -150,13 +151,11 @@ export const router = createBrowserRouter([
       },
       {
         path: 'backup',
-        element: (
-          <ModulePlaceholder
-            title="النسخ الاحتياطي والاستعادة"
-            subtitle="تصدير نسخة مشفرة كاملة من قاعدة البيانات المحلية واستعادتها بضغطة زر"
-            icon={DatabaseBackup}
-          />
-        ),
+        element: <BackupPage />,
+      },
+      {
+        path: 'sync-conflicts',
+        element: <SyncConflictsPage />,
       },
       {
         path: 'settings',

@@ -21,12 +21,14 @@ vi.mock('../src/lib/supabase', () => ({
 }));
 
 import { db } from '../src/db';
+import { supabase } from '../src/lib/supabase';
 import { OutboxRepository } from '../src/db/outbox';
 import { SyncEngine } from '../src/services/sync/syncEngine';
 import type { Item, JournalEntry, OutboxItem } from '../src/types/database';
 
 describe('Phase 2b-2: Sync Engine Verification Suite', () => {
   beforeEach(async () => {
+    vi.clearAllMocks();
     await db.items.clear();
     await db.journal_entries.clear();
     await db.documents.clear();
@@ -949,5 +951,244 @@ describe('Phase 2b-2: Sync Engine Verification Suite', () => {
     await OutboxRepository.markApplied([queued.id]);
     const opInDb = await db.outbox.get(queued.id);
     expect(opInDb).toBeUndefined();
+  });
+
+  // =========================================================================
+  // Test (n): REAL Send Path for Document Bundles via Edge Function (sync-push)
+  // Verifies pushOperation WITHOUT customExecutor:
+  // - Passes Bearer JWT in headers
+  // - Structures payload with document_bundle
+  // - Calls supabase.functions.invoke('sync-push', ...)
+  // - Reconciles authoritative server_row and lines into Dexie db.documents and db.document_lines
+  // =========================================================================
+  it('(n) proves real send path invokes sync-push Edge Function with document_bundle and reconciles locally', async () => {
+    const docId = crypto.randomUUID();
+    const lineId = crypto.randomUUID();
+    const branchId = crypto.randomUUID();
+
+    const bundle = SyncEngine.buildDocumentBundle({
+      header: {
+        id: docId,
+        branch_id: branchId,
+        doc_type: 'sales_invoice',
+        series_code: 'POS02',
+        seq_no: 202,
+        doc_no: 'INV-POS02-000202',
+        doc_date: '2026-11-02',
+        subtotal: 1000,
+        total: 1000,
+      },
+      lines: [
+        {
+          id: lineId,
+          document_id: docId,
+          line_no: 1,
+          qty: 4,
+          unit_price: 250,
+          line_total: 1000,
+        },
+      ],
+      post_now: true,
+    });
+
+    const queued = await OutboxRepository.queueOperation({
+      entity: 'documents',
+      entity_id: docId,
+      op: 'post',
+      payload: {
+        is_bundle: true,
+        header: bundle.header,
+        lines: bundle.lines,
+        post_now: bundle.post_now,
+      },
+      user_id: 'real-user-uuid',
+    });
+
+    // Mock Edge Function invoke success response
+    const mockServerDoc = {
+      ...bundle.header,
+      status: 'posted',
+      posted_at: '2026-11-02T14:00:00.000Z',
+      version: 2,
+      server_seq: 500,
+      created_at: '2026-11-02T14:00:00.000Z',
+      updated_at: '2026-11-02T14:00:00.000Z',
+    };
+    const mockServerLine = {
+      ...bundle.lines[0],
+      version: 1,
+      server_seq: 501,
+      created_at: '2026-11-02T14:00:00.000Z',
+      updated_at: '2026-11-02T14:00:00.000Z',
+    };
+
+    vi.mocked(supabase.functions.invoke).mockResolvedValueOnce({
+      data: {
+        success: true,
+        status: 'applied',
+        code: 'ok',
+        document_id: docId,
+        server_row: mockServerDoc,
+        lines: [mockServerLine],
+      },
+      error: null,
+    } as any);
+
+    // Call real pushOperation without customExecutor, passing caller JWT
+    const pushRes = await SyncEngine.pushOperation(queued, {
+      jwt: 'bearer-test-token-xyz',
+    });
+
+    // 1. Verify Edge Function invocation parameters
+    expect(supabase.functions.invoke).toHaveBeenCalledWith('sync-push', {
+      headers: {
+        Authorization: 'Bearer bearer-test-token-xyz',
+      },
+      body: {
+        document_bundle: {
+          op_id: queued.op_id,
+          header: bundle.header,
+          lines: bundle.lines,
+          post_now: true,
+          client_ts: queued.client_ts,
+        },
+      },
+    });
+
+    // 2. Verify response
+    expect(pushRes.success).toBe(true);
+    expect(pushRes.status).toBe('applied');
+    expect(pushRes.server_row?.version).toBe(2);
+    expect(pushRes.server_row?.server_seq).toBe(500);
+
+    // 3. Verify real local Dexie reconciliation
+    const docInDb = await db.documents.get(docId);
+    expect(docInDb).toBeDefined();
+    expect(docInDb?.id).toBe(docId);
+    expect(docInDb?.version).toBe(2);
+    expect(docInDb?.server_seq).toBe(500);
+    expect(docInDb?.status).toBe('posted');
+
+    const lineInDb = await db.document_lines.get(lineId);
+    expect(lineInDb).toBeDefined();
+    expect(lineInDb?.id).toBe(lineId);
+    expect(lineInDb?.server_seq).toBe(501);
+  });
+
+  // =========================================================================
+  // Test (o): REAL Send Path Fallback via Direct RPC (sync_push_document)
+  // Verifies that when sync-push Edge Function fails or is not deployed,
+  // pushOperation falls back to executeDirectUserOperation:
+  // - Directly invokes supabase.rpc('sync_push_document', ...) with caller credentials
+  // - Reconciles server_row and lines into Dexie db.documents and db.document_lines
+  // =========================================================================
+  it('(o) proves real send path fallback executes sync_push_document RPC directly when Edge Function is unavailable', async () => {
+    const docId = crypto.randomUUID();
+    const lineId = crypto.randomUUID();
+
+    const bundle = SyncEngine.buildDocumentBundle({
+      header: {
+        id: docId,
+        branch_id: crypto.randomUUID(),
+        doc_type: 'purchase_invoice',
+        series_code: 'PUR01',
+        seq_no: 301,
+        doc_no: 'INV-PUR01-000301',
+        doc_date: '2026-11-02',
+        subtotal: 1200,
+        total: 1200,
+      },
+      lines: [
+        {
+          id: lineId,
+          document_id: docId,
+          line_no: 1,
+          qty: 10,
+          unit_price: 120,
+          line_total: 1200,
+        },
+      ],
+      post_now: false,
+    });
+
+    const queued = await OutboxRepository.queueOperation({
+      entity: 'documents',
+      entity_id: docId,
+      op: 'insert',
+      payload: {
+        is_bundle: true,
+        header: bundle.header,
+        lines: bundle.lines,
+        post_now: bundle.post_now,
+      },
+      user_id: 'real-user-uuid',
+    });
+
+    // 1. Edge Function fails (e.g. gateway 500 error / not deployed)
+    vi.mocked(supabase.functions.invoke).mockResolvedValueOnce({
+      data: null,
+      error: new Error('Edge function not deployed in test environment'),
+    } as any);
+
+    // 2. Direct RPC succeeds
+    const mockRpcServerDoc = {
+      ...bundle.header,
+      status: 'draft',
+      version: 1,
+      server_seq: 600,
+      created_at: '2026-11-02T15:00:00.000Z',
+      updated_at: '2026-11-02T15:00:00.000Z',
+    };
+    const mockRpcServerLine = {
+      ...bundle.lines[0],
+      version: 1,
+      server_seq: 601,
+      created_at: '2026-11-02T15:00:00.000Z',
+      updated_at: '2026-11-02T15:00:00.000Z',
+    };
+
+    vi.mocked(supabase.rpc).mockResolvedValueOnce({
+      data: {
+        success: true,
+        status: 'applied',
+        code: 'ok',
+        document_id: docId,
+        server_row: mockRpcServerDoc,
+        lines: [mockRpcServerLine],
+      },
+      error: null,
+    } as any);
+
+    const pushRes = await SyncEngine.pushOperation(queued, {
+      jwt: 'bearer-test-token-rpc',
+    });
+
+    // 1. Verify fallback was triggered
+    expect(supabase.functions.invoke).toHaveBeenCalledTimes(1);
+    expect(supabase.rpc).toHaveBeenCalledWith('sync_push_document', {
+      p_op_id: queued.op_id,
+      p_header: bundle.header,
+      p_lines: bundle.lines,
+      p_post_now: false,
+      p_client_ts: queued.client_ts,
+    });
+
+    // 2. Verify push response
+    expect(pushRes.success).toBe(true);
+    expect(pushRes.status).toBe('applied');
+    expect(pushRes.server_row?.version).toBe(1);
+    expect(pushRes.server_row?.server_seq).toBe(600);
+
+    // 3. Verify Dexie local store was updated by direct RPC reconciliation
+    const docInDb = await db.documents.get(docId);
+    expect(docInDb).toBeDefined();
+    expect(docInDb?.id).toBe(docId);
+    expect(docInDb?.version).toBe(1);
+    expect(docInDb?.server_seq).toBe(600);
+
+    const lineInDb = await db.document_lines.get(lineId);
+    expect(lineInDb).toBeDefined();
+    expect(lineInDb?.id).toBe(lineId);
+    expect(lineInDb?.server_seq).toBe(601);
   });
 });

@@ -662,6 +662,34 @@ export class SyncEngine {
         if (classification.isPermanent) {
           // Permanent failure / RLS denial / 42xxx / constraint violation / optimistic conflict
           await OutboxRepository.markFailed(item.id, classification.message, classification.isConflict);
+
+          if (classification.isConflict) {
+            try {
+              const existingConflict = await db.sync_conflicts.where('entity_id').equals(item.entity_id).first();
+              if (!existingConflict) {
+                const localTable = (db as any)[item.entity];
+                const localRow = localTable ? await localTable.get(item.entity_id) : null;
+                await db.sync_conflicts.put({
+                  id: crypto.randomUUID(),
+                  entity: item.entity,
+                  entity_id: item.entity_id,
+                  local_payload: item.payload || (localRow as Record<string, any>) || {},
+                  server_payload: res.errorObj?.server_row || {},
+                  base_version: item.base_version || localRow?.version || 1,
+                  version: 1,
+                  server_seq: 0,
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                  resolution: null,
+                  resolved_at: null,
+                  resolved_by: null,
+                });
+              }
+            } catch (conflictErr) {
+              console.error('Failed to register push conflict in sync_conflicts:', conflictErr);
+            }
+          }
+
           failedCount++;
           errors.push(`Operation ${item.id} (${item.entity}) permanently failed: ${classification.message}`);
         } else {

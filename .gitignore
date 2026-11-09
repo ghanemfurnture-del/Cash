@@ -35,3 +35,16 @@ dist-ssr
 .tmp
 coverage
 
+# Certificates and keys
+*.pem
+*.key
+
+# Backups and encrypted dumps
+backups/
+*.enc
+*.sql.enc
+*.dump
+
+# Supabase local temp
+supabase/.temp/
+

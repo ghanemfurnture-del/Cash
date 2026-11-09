@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { WifiOff, AlertTriangle, CheckCircle2, RefreshCw } from 'lucide-react';
 import { OutboxRepository } from '../../db/outbox';
@@ -15,7 +16,9 @@ export const SyncStatusPill: React.FC = () => {
   const refreshCounts = async () => {
     try {
       const c = await OutboxRepository.getCounts();
-      setCounts(c);
+      const conflictRecords = await db.sync_conflicts.filter((r) => !r.resolved_at).count();
+      const maxConflicts = Math.max(c.conflict, conflictRecords);
+      setCounts({ ...c, conflict: maxConflicts });
 
       const lastSync = await db.sync_meta.get('last_sync_timestamp');
       if (lastSync?.value) {
@@ -77,13 +80,14 @@ export const SyncStatusPill: React.FC = () => {
   // Conflicts State
   if (counts.conflict > 0) {
     return (
-      <div
-        className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-rose-50 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300 border border-rose-200 dark:border-rose-800 select-none animate-pulse"
-        title="يوجد تعارض في البيانات بحاجة إلى مراجعة في جدول التعارضات"
+      <Link
+        to="/sync-conflicts"
+        className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-rose-50 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300 border border-rose-200 dark:border-rose-800 select-none animate-pulse hover:bg-rose-100 dark:hover:bg-rose-900/50 transition-colors cursor-pointer"
+        title="يوجد تعارض في البيانات بحاجة إلى مراجعة في جدول التعارضات (انقر للمعالجة)"
       >
         <AlertTriangle className="w-3.5 h-3.5" />
         <span>{t('sync.conflicts', { count: counts.conflict })}</span>
-      </div>
+      </Link>
     );
   }
 

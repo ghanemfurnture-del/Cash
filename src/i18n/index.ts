@@ -27,6 +27,7 @@ export const resources = {
         settings: 'الإعدادات',
         audit: 'سجل التدقيق',
         backup: 'النسخ الاحتياطي',
+        conflicts: 'معالجة التعارضات',
         more: 'المزيد',
       },
       sync: {
@@ -108,6 +109,7 @@ export const resources = {
         settings: 'Settings',
         audit: 'Audit Log',
         backup: 'Backup & Restore',
+        conflicts: 'Conflicts',
         more: 'More',
       },
       sync: {
