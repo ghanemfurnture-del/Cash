@@ -10,6 +10,7 @@ export const DevDataGenerator: React.FC = () => {
   }
 
   const [hasRealData, setHasRealData] = useState(false);
+  const [includeOutbox, setIncludeOutbox] = useState(false);
   const [confirmInput, setConfirmInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
@@ -214,21 +215,23 @@ export const DevDataGenerator: React.FC = () => {
             } as any);
           }
 
-          // 7. Queue 3 mock pending outbox operations
-          for (let k = 8; k <= 10; k++) {
-            const outboxDocId = `dev-doc-${String(k).padStart(3, '0')}`;
-            await OutboxRepository.queueOperation({
-              entity: 'documents',
-              entity_id: outboxDocId,
-              op: 'insert',
-              payload: {
-                id: outboxDocId,
-                doc_no: `INV-D1-${String(k).padStart(6, '0')}`,
-                total: 1000 * k * 1.14,
-                is_mock: true,
-              },
-              user_id: 'dev-user-mock',
-            });
+          // 7. Queue mock pending outbox operations (ONLY if explicitly enabled by user)
+          if (includeOutbox) {
+            for (let k = 8; k <= 10; k++) {
+              const outboxDocId = `dev-doc-${String(k).padStart(3, '0')}`;
+              await OutboxRepository.queueOperation({
+                entity: 'documents',
+                entity_id: outboxDocId,
+                op: 'insert',
+                payload: {
+                  id: outboxDocId,
+                  doc_no: `INV-D1-${String(k).padStart(6, '0')}`,
+                  total: 1000 * k * 1.14,
+                  is_mock: true,
+                },
+                user_id: 'dev-user-mock',
+              });
+            }
           }
 
           // 8. Update counter in sync_meta
@@ -241,7 +244,9 @@ export const DevDataGenerator: React.FC = () => {
       );
 
       setMessage({
-        text: 'تم توليد البيانات التجريبية بنجاح: 10 فواتير (INV-D1-000001 إلى INV-D1-000010) و3 عمليات معلقة في صندوق الصادر.',
+        text: includeOutbox
+          ? 'تم توليد البيانات التجريبية بنجاح: 10 فواتير (INV-D1-000001 إلى INV-D1-000010) و3 عمليات معلقة في صندوق الصادر.'
+          : 'تم توليد البيانات التجريبية بنجاح: 10 فواتير محلية فقط (دون إرسال أو قيد عمليات في صندوق الصادر).',
         type: 'success',
       });
       setConfirmInput('');
@@ -362,6 +367,31 @@ export const DevDataGenerator: React.FC = () => {
           />
         </div>
       )}
+
+      {/* Outbox opt-in option with safety warning */}
+      <div className="space-y-2 p-3 bg-background/60 rounded-xl border border-border">
+        <label className="flex items-center gap-2 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            data-testid="dev-include-outbox-checkbox"
+            checked={includeOutbox}
+            onChange={(e) => setIncludeOutbox(e.target.checked)}
+            className="w-4 h-4 rounded border-input text-amber-600 focus:ring-amber-500 cursor-pointer"
+          />
+          <span className="text-xs font-semibold text-foreground">
+            تضمين عمليات المزامنة في Outbox
+          </span>
+        </label>
+        {includeOutbox && (
+          <div
+            data-testid="dev-outbox-warning"
+            className="p-2.5 bg-rose-500/15 border border-rose-500/30 rounded-lg flex items-center gap-2 text-rose-600 dark:text-rose-400 text-xs font-bold"
+          >
+            <ShieldAlert className="w-4 h-4 shrink-0" />
+            <span>تنبيه: سيتم إرسال البيانات التجريبية إلى سيرفر الإنتاج في المزامنة القادمة</span>
+          </div>
+        )}
+      </div>
 
       <div className="flex flex-wrap items-center gap-3 pt-1">
         <button

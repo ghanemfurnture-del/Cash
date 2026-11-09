@@ -27,7 +27,10 @@ import type {
   PersistenceStatus,
   RestorePreview,
 } from '../../services/backup/types';
-import { DevDataGenerator } from '../dev/DevDataGenerator';
+
+const DevDataGenerator = import.meta.env.DEV
+  ? React.lazy(() => import('../dev/DevDataGenerator').then((m) => ({ default: m.DevDataGenerator })))
+  : null;
 
 export const BackupPage: React.FC = () => {
   // Persistence state
@@ -586,7 +589,11 @@ export const BackupPage: React.FC = () => {
       )}
 
       {/* Dev-Only Seed Data Tool (Strictly conditional on import.meta.env.DEV) */}
-      <DevDataGenerator />
+      {import.meta.env.DEV && DevDataGenerator && (
+        <React.Suspense fallback={<div className="p-4 text-xs text-muted-foreground">جاري تحميل أداة التطوير...</div>}>
+          <DevDataGenerator />
+        </React.Suspense>
+      )}
     </div>
   );
 };

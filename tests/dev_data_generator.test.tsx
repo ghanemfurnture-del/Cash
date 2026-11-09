@@ -37,7 +37,7 @@ describe('Phase 2b-3b Stage A Item 6: Dev-Only Mock Data Generator Suite', () =>
     }
   });
 
-  it('DEV ENVIRONMENT: generates exactly 10 mock documents (INV-D1-000001 to INV-D1-000010), outbox items, and tags with is_mock', async () => {
+  it('DEV ENVIRONMENT: generates exactly 10 mock documents (INV-D1-000001 to INV-D1-000010) with ZERO outbox items by default', async () => {
     render(<DevDataGenerator />);
 
     const generateBtn = screen.getByRole('button', { name: /توليد 10 فواتير وبيانات تجريبية/i });
@@ -66,12 +66,9 @@ describe('Phase 2b-3b Stage A Item 6: Dev-Only Mock Data Generator Suite', () =>
     const linesCount = await db.document_lines.count();
     expect(linesCount).toBe(10);
 
-    // Verify Outbox pending operations
+    // Verify Outbox pending operations is ZERO by default
     const outboxOps = await db.outbox.toArray();
-    expect(outboxOps.length).toBe(3);
-    for (const op of outboxOps) {
-      expect((op.payload as any).is_mock).toBe(true);
-    }
+    expect(outboxOps.length).toBe(0);
 
     // Verify counter
     const counter = await db.sync_meta.get('counter:sale_invoice:D1');
@@ -82,6 +79,37 @@ describe('Phase 2b-3b Stage A Item 6: Dev-Only Mock Data Generator Suite', () =>
     expect(await db.items.count()).toBe(2);
     expect(await db.parties.count()).toBe(2);
     expect(await db.accounts.count()).toBe(4);
+  });
+
+  it('DEV ENVIRONMENT: writes 3 outbox operations when explicit outbox option is checked', async () => {
+    render(<DevDataGenerator />);
+
+    const checkbox = screen.getByTestId('dev-include-outbox-checkbox');
+    expect((checkbox as HTMLInputElement).checked).toBe(false);
+
+    // Check the box
+    fireEvent.click(checkbox);
+    expect((checkbox as HTMLInputElement).checked).toBe(true);
+
+    // Verify warning appears
+    expect(screen.getByTestId('dev-outbox-warning')).toBeDefined();
+    expect(
+      screen.getByText(/تنبيه: سيتم إرسال البيانات التجريبية إلى سيرفر الإنتاج في المزامنة القادمة/i)
+    ).toBeDefined();
+
+    const generateBtn = screen.getByRole('button', { name: /توليد 10 فواتير وبيانات تجريبية/i });
+    fireEvent.click(generateBtn);
+
+    await waitFor(async () => {
+      const docsCount = await db.documents.count();
+      expect(docsCount).toBe(10);
+    });
+
+    const outboxOps = await db.outbox.toArray();
+    expect(outboxOps.length).toBe(3);
+    for (const op of outboxOps) {
+      expect((op.payload as any).is_mock).toBe(true);
+    }
   });
 
   it('PROTECTION: requires explicit confirmation phrase if real (non-mock) data exists', async () => {
