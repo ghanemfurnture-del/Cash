@@ -231,7 +231,7 @@ export async function executeRestore(
       snapshotDb.close();
       await Dexie.delete('cash_safety_snapshot_temp');
     }
-    throw new Error(BACKUP_ERRORS.SAFETY_SNAPSHOT_FAILED);
+    throw new Error(BACKUP_ERRORS.SAFETY_SNAPSHOT_FAILED, { cause: err });
   }
 
   // 2. STEP 2: Compute Maximum Sequence Numbers for each series

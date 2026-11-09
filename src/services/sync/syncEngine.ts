@@ -158,7 +158,7 @@ export class SyncEngine {
     const lookbackIso = new Date(lookbackMs).toISOString();
 
     // 2. Fetch rows from Supabase (or custom fetchFn for tests)
-    let rows: T[] = [];
+    let rows: T[];
     if (options?.fetchFn) {
       rows = await options.fetchFn({
         minSeq: lastSeq,

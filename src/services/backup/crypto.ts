@@ -236,6 +236,6 @@ export async function decryptBackupPayload(
     return dec.decode(decryptedBuffer);
   } catch (err: any) {
     // In AES-GCM, tag mismatch occurs for wrong password OR tampered ciphertext / header
-    throw new Error(BACKUP_ERRORS.WRONG_PASSWORD);
+    throw new Error(BACKUP_ERRORS.WRONG_PASSWORD, { cause: err });
   }
 }
