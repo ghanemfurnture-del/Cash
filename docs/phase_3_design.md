@@ -118,7 +118,7 @@ journal entry ... not balanced (debit 0, credit 0, lines 0)
 ## 4. إغلاق الفترات المالية وتعارضات الأوفلاين (Period Closing & Offline Edge Cases)
 
 ### المعضلة التشغيلية:
-إذا أنشأ كاشير فاتورة أوفلاين بتاريخ `2026-01-31`، وخلال انقطاع الإنترنت قام المحاسب بإقفال الفترة المالية لشهر يناير (`is_closed = true`)، ثم اتصل الكاشير بالإنترنت في `2026-02-02`.
+إذا أنشأ كاشير فاتورة أوفلاين بتاريخ `2026-01-31`، وخلال انقطاع الإنترنت قام المحاسب بإقفال الفترة المالية لشهر يناير (`status = 'closed'`)، ثم اتصل الكاشير بالإنترنت في `2026-02-02`.
 
 ### الخيارات المعمارية المتاحة:
 1. **الخيار 1 (الموصى به تقنياً):** رفض الحزمة عبر محفز `require_open_period` وتسجيلها كنزاع في جدول `sync_conflicts` ليتدخل المحاسب يدوياً. هذا يضمن حماية الفترات المقفولة قانونياً.
@@ -127,11 +127,28 @@ journal entry ... not balanced (debit 0, credit 0, lines 0)
 
 > **تنبيه:** القرار النهائي لاختيار أحد الخيارات الثلاثة متروك للمالك والمحاسب القانوني في [وثيقة القرارات المطلوبة (docs/decisions_needed.md)](file:///e:/cash/docs/decisions_needed.md)؛ ولم يتم اعتماد أي خيار كودياً في هذه المرحلة.
 
+### 4.1 حالة الفترات على العميل (`fiscal_periods` on Client):
+- **الحاجة المعمارية للعميل:** لكي يعرف جهاز الكاشير والفرع حالة الفترات المقفولة محلياً قبل وبعد انقطاع الاتصال، يجب أن تكون بيانات `fiscal_periods` متاحة ومحدّثة دائماً في قاعدة **Dexie**، ومسحوبة دورياً في المزامنة (**Pull**)، ومشمولة في **النسخ الاحتياطي والاستعادة** (حتى لا يفقد الجهاز المستعاد حالة الإقفال قبل إعادة المزامنة).
+- **الوضع الفعلي المرصود في الكود الحالي:**
+  - جدول `fiscal_periods` **معرّف بالفعل** في Dexie ([`src/db/index.ts`](file:///e:/cash/src/db/index.ts#L82)) ومفهرس في السطر `163` (`fiscal_year_id, status, start_date, end_date, server_seq`).
+  - الجدول **مدرج بالفعل** في مصفوفة المزامنة `SYNCABLE_V1_TABLES` ([`src/services/sync/syncEngine.ts`](file:///e:/cash/src/services/sync/syncEngine.ts#L63)) ومقيد على السيرفر كجدول سحب فقط (`pull-only` في [`007` سطر 223](file:///e:/cash/supabase/migrations/007_sync_engine_rpcs.sql#L223)).
+  - **النقص الحالي الواجب استكماله لاحقاً:** الجدول **غير مشمول بعد** في جداول النسخ الاحتياطي (`CORE_BACKUP_TABLES` في [`src/services/backup/types.ts`](file:///e:/cash/src/services/backup/types.ts#L8-L22) و`SafetySnapshotDatabase` في [`restoreService.ts`](file:///e:/cash/src/services/backup/restoreService.ts#L26-L48))؛ كما لا يوجد حتى الآن على مستوى قاعدة البيانات قيد يمنع تداخل تواريخ الفترات المالية (`EXCLUDE USING gist`).
+- **تأكيد بقاء السياسة مفتوحة:** تضمين `fiscal_periods` محلياً يمكّن الجهاز من معرفة حالة الفترات، لكن **سياسة التعامل مع القيد/المستند المنشأ أوفلاين لفترة مقفولة تظل قراراً مفتوحاً** غير معتمد كودياً حتى يقررها المالك والمحاسب.
+
+### 4.2 عكس قيد تاريخه داخل فترة مقفولة (نقطة تحتاج قرار محاسب):
+- **السلوك الفعلي للمحفز على السيرفر (`require_open_period` في [`005` سطر 56](file:///e:/cash/supabase/migrations/005_v1_rls_and_security_triggers.sql#L56)):**  
+  يفحص المحفز انفتاح الفترة فقط عندما تكون `new.status = 'posted'` (`if new.status = 'posted' and (tg_op = 'INSERT' or old.status is distinct from 'posted')`).
+- **النتيجة المترتبة على عكس قيد قديم من فترة مقفولة:**
+  1. تغيير حالة القيد الأصلي من `posted` إلى `reversed` **لا يفعّل** `require_open_period` (لأن `new.status = 'reversed'` وليس `'posted'`)، ويمر أيضاً من `block_posted_changes`.
+  2. أما القيد العكسي الجديد فيُفحص تاريخه (`p_reversal_date`) عند الترحيل إلى `'posted'`: ينجح إذا كان `p_reversal_date` في **فترة مفتوحة** حالياً، ويُرفض إذا حُدد بتاريخ يقع في **فترة مقفولة**.
+- **قرار محاسبي مطلوب:** هل يُعتمد السماح بعكس قيود الفترات المقفولة بإثبات أثر العكس بتاريخ اليوم داخل الفترة **المفتوحة** الحالية (وهو الأسلوب المحاسبي القياسي دون المساس بأرقام الفترة المقفولة التاريخية)، أم يجب حظر وسم القيد الأصلي كـ `reversed` نهائياً متى أُقفلت فترته؟
+
 ---
 
 ## 5. مصفوفة الترحيل الافتراضية (Default Posting Matrix)
 
 > ⚠️ **ملاحظة:** هذه مصفوفة استرشادية موسومة بـ **"مسودة بانتظار اعتماد محاسب قانوني"**.  
+> **ملحوظة بشأن أكواد الدليل:** الأكواد الواردة في الجدول أدناه (`1111`..`5xxx`) هي رموز توضيحية أولية لا تتطابق حرفياً مع الترقيم السداسي في [`docs/chart_of_accounts_proposal.md`](file:///e:/cash/docs/chart_of_accounts_proposal.md) (`110101`..`530108`) ولا مع البذور الرباعية في [`006_v1_seed_roles_permissions_and_coa.sql`](file:///e:/cash/supabase/migrations/006_v1_seed_roles_permissions_and_coa.sql) (`1101`..`5203`). عند التنفيذ الفعلي في المرحلة 3، يجب ألا يعتمد التوجيه على أرقام ثابتة في الكود، بل على مفاتيح جدول `account_mappings` (`cash_default`, `receivables`, `inventory`, `vat_input`, `payables`, `vat_output`, `sales_revenue`, `sales_returns`, ...).  
 > **ملحوظة جوهرية بشأن تكلفة البضاعة المباعة (COGS):** قيد تكلفة البضاعة المباعة (من حـ/ تكلفة المبيعات إلى حـ/ مخزون البضائع) لفواتير المبيعات **مؤجل بالكامل إلى المرحلة 6 (المخزون والتكاليف)** عند اكتمال تقييم المخزون وحساب متوسط التكلفة المرجح. المرحلة 3 تسجل فقط أطراف الإيراد والضريبة والمدينين/النقدية.
 
 | نوع المستند | الحساب المدين (Dr) | الحساب الدائن (Cr) | مركز التكلفة | ملاحظات |
@@ -172,16 +189,25 @@ journal entry ... not balanced (debit 0, credit 0, lines 0)
   - الرقم المركب: `JE-D1-000001`.
   - **قاعدة منع تراجع العدادات عند الاستعادة:** $\text{new\_seq} = \max(\text{local\_current}, \text{restored\_max})$.
 - **تصحيح القيود المعتمدة (Reversals):**
-  - محفز `block_posted_changes` يمنع منعاً باتاً تعديل أو حذف أي قيد حالته `posted`.
+  - محفز `block_posted_changes` ([`005` سطر 25](file:///e:/cash/supabase/migrations/005_v1_rls_and_security_triggers.sql#L25)) يمنع منعاً باتاً تعديل أو حذف أي قيد حالته `posted` أو `reversed`.
   - الاستثناء الوحيد المصرح به في المحفز:  
-    `if new.status = 'reversed' and old.status = 'posted' then return new; end if;`
-  - لتصحيح قيد، يتم استدعاء دالة `create_journal_reversal_entry` بتمرير المعرفات والتسلسل من العميل (`p_reversal_id`, `p_series_code`, `p_seq_no`, `p_entry_no`). تُنشئ الدالة قيداً عكسياً جديداً (المدين دائن والدائن مدين)، وترحله، ثم توسم القيد الأصلي بـ `reversed` بصورة ذرية.
+    `if not (old.status = 'posted' and new.status = 'reversed') then raise exception ...;`
+  - لتصحيح قيد، يتم استدعاء دالة `create_journal_reversal_entry` بتمرير معرف القيد المعكوس وتسلسله ومعرفات بنوده من العميل (`p_reversal_id`, `p_series_code`, `p_seq_no`, `p_entry_no`, `p_line_ids jsonb`). تُنشئ الدالة قيداً عكسياً جديداً بالمعرفات الممررة دون أي توليد عشوائي على الخادم، وترحله، ثم توسم القيد الأصلي بـ `reversed` بصورة ذرية.
+
+### 7.1 حصانة بنود القيود (`journal_lines`) والثغرات المرصودة (تحتاج قراراً ومعالجة):
+- **الحالة الطبيعية (`INSERT` / `UPDATE` / `DELETE` لبند قيد `posted`):**  
+  تُرفض مباشرة عبر محفز `trg_block_jl` الذي يشغّل `block_posted_children('journal_entries', 'entry_id')` ([`001` سطر 392](file:///e:/cash/supabase/migrations/001_core_schema.sql#L392)، [`005` سطر 33-48](file:///e:/cash/supabase/migrations/005_v1_rls_and_security_triggers.sql#L33-L48)) رافعاً الاستثناء `'cannot change lines of a posted record'`.
+- **نقطتان وثغرتان مرصودتان في البنية الحالية تحتاجان قرار معالجة في هجرة المرحلة 3:**
+  1. **ثغرة إعادة ربط `entry_id` في `block_posted_children`:**  
+     في حالة `UPDATE`، تفحص الدالة فقط `pid := (to_jsonb(new) ->> tg_argv[1])::uuid` ولا تفحص `OLD.entry_id`. وبما أن عمود `entry_id` مدرج ضمن قائمة السماح في `sync_push_op` ([`007` سطر 367](file:///e:/cash/supabase/migrations/007_sync_engine_rpcs.sql#L367))، يمكن عملياً تحديث بند يتبع قيداً **مرحلاً (`posted`)** لنقله إلى قيد آخر بحالة **`draft`** دون أن يوقفه `trg_block_jl`، مما يكسر توازن القيد المرحل الأصل! (وينطبق نفس الأثر على `document_lines.document_id`).
+  2. **غياب إعادة فحص التوازن عند تغيير البنود:**  
+     محفز `check_entry_balanced` ([`005` سطر 70-89](file:///e:/cash/supabase/migrations/005_v1_rls_and_security_triggers.sql#L70-L89)) يرتبط بجدول `journal_entries` فقط ولا يعاد تشغيله عند تغيير `journal_lines`. يجب حسم الحل في المرحلة 3 إما بمنع تعديل `entry_id`/`document_id` وتحديث `block_posted_children` لفحص `old` و `new` معاً، وإما بإضافة فحص توازن مؤجل (`CONSTRAINT TRIGGER DEFERRABLE`) حسب قرار المالك والمراجع المحاسبي.
 
 ---
 
 ## 8. مسودات الهجرات للمرحلة 3 (Draft Migrations)
 
-1. **`supabase/migrations_draft/009_core_ledger_helpers_draft.sql` (المرحلة 3):** مساعدات النواة المحاسبية، قيود التحقق الإضافية، فهارس الأداء، دالة ميزان المراجعة، ودالة إنشاء القيود العكسية المتوافقة مع أرقام العميل.
+1. **`supabase/migrations_draft/009_core_ledger_helpers_draft.sql` (المرحلة 3):** مساعدات النواة المحاسبية، قيود التحقق الإضافية، فهارس الأداء، دالة ميزان المراجعة، ودالة إنشاء القيود العكسية المتوافقة مع أرقام ومعرفات العميل (`p_line_ids jsonb`).
 2. **تحديث `sync_push_document` (المرحلة 3):** دمج استيعاب الفاتورة وقيدها ذرياً في هجرة معتمدة للمرحلة 3.
 3. **`010_eta_readiness.sql` (المرحلة 4):** أعمدة وتجهيزات منظومة الفاتورة الإلكترونية المصرية.
 4. **`011_seed_tax_defaults_draft.sql` (المرحلة 4):** بذور الجداول الضريبية وشجرة الحسابات الأولية.
@@ -190,11 +216,11 @@ journal entry ... not balanced (debit 0, credit 0, lines 0)
 
 ## 9. خطة اختبارات المرحلة 3 (Phase 3 Test Suite)
 
-- اختبارات النواة وقواعد القيد المزدوج تدار عبر السكربت [`supabase/tests/draft_009_ledger_validation_test.sql`](file:///e:/cash/supabase/tests/draft_009_ledger_validation_test.sql):
+- اختبارات النواة وقواعد القيد المزدوج تدار عبر السكربت [`supabase/tests/draft_009_ledger_validation_test.sql`](file:///e:/cash/supabase/tests/draft_009_ledger_validation_test.sql) (مستقل بذاته بـ fixtures عام `2099` وتعريف دالة العكس داخله وينتهي بـ `ROLLBACK;`):
   1. قبول القيد المتوازن وترحيله بنجاح.
   2. رفض القيد غير المتوازن عبر `check_entry_balanced`.
-  3. حظر تعديل بنود أو رؤوس القيود المعتمدة عبر `block_posted_changes`.
-  4. حظر إدخال أو ترحيل القيود داخل الفترات المالية المقفلة عبر `require_open_period`.
-  5. فحص سلامة دالة العكس الآلي للقيود `create_journal_reversal_entry` وانقلاب البنود.
-  6. فحص تسلسل الترحيل الذري (draft -> lines -> posted) في معاملة واحدة.
-  7. التحقق من انتهاء الاختبار دائماً بـ `ROLLBACK;` لضمان نظافة بيئة الاختبار.
+  3. حظر تعديل بنود القيد المعتمد **وحظر `INSERT` بند جديد** في قيد `posted` عبر `block_posted_children`.
+  4. حظر ترحيل القيد المتوازن داخل الفترة المالية المقفلة عبر `require_open_period`.
+  5. فحص سلامة دالة العكس الآلي للقيود `create_journal_reversal_entry` (معرفات بنود `jsonb` من العميل) وانقلاب البنود.
+  6. فحص عكس قيد تاريخه داخل فترة مقفولة (نجاحه عند الترحيل بتاريخ فترة مفتوحة، وحظره عند الترحيل بتاريخ فترة مقفولة).
+  7. فحص تسلسل الترحيل الذري (draft -> lines -> posted) في معاملة واحدة.

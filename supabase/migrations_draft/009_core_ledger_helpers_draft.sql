@@ -1,6 +1,6 @@
 -- ==============================================================================
 -- DRAFT MIGRATION: 009_core_ledger_helpers_draft.sql
--- Module: Phase 3 Core Ledger Helpers, Performance Views, and Reversal Utility
+-- Module: Phase 3 Core Ledger Helpers, Performance Indexes, and Reversal Utility
 -- Status: DRAFT / SPECIFICATION ONLY (NOT APPLIED TO DATABASE)
 -- Note: Bundle ingestion for documents+journal is specified for sync_push_document
 -- ==============================================================================
@@ -69,9 +69,17 @@ $$;
 
 -- 4. Reversal Entry Helper Function
 -- Enforces that reversals are strictly created as new counter-entries rather than editing posted rows.
--- Invariant: All UUIDs and sequence numbers MUST be provided by client (no server max()+1 or gen_random_uuid).
--- Security & Immutability: block_posted_changes trigger explicitly permits transition from 'posted' to 'reversed':
---   `if new.status = 'reversed' and old.status = 'posted' then return new; end if;`
+-- INVARIANT: ALL UUIDs (header p_reversal_id AND every line UUID inside p_line_ids jsonb) and sequence numbers
+-- MUST be generated and provided by the client. No server-side max()+1, gen_random_uuid(), or uuid_generate_v4().
+-- SECURITY & IMMUTABILITY (005_v1_rls_and_security_triggers.sql):
+--   * block_posted_changes (line 25): `if not (old.status = 'posted' and new.status = 'reversed') then raise exception ...;`
+--     Explicitly permits transitioning the original entry strictly from 'posted' to 'reversed'.
+--   * require_open_period (line 56): checks open fiscal period ONLY when `new.status = 'posted'`.
+--     Thus, flipping original entry from 'posted' to 'reversed' is NOT blocked even if its date is in a closed period,
+--     whereas posting the NEW reversal entry (step 6) strictly requires p_reversal_date to fall in an OPEN period.
+drop function if exists public.create_journal_reversal_entry(uuid, uuid, text, int, text, date, text);
+drop function if exists public.create_journal_reversal_entry(uuid, uuid, text, int, text, date, text, jsonb);
+
 create or replace function public.create_journal_reversal_entry(
   p_original_entry_id uuid,
   p_reversal_id uuid,
@@ -79,7 +87,8 @@ create or replace function public.create_journal_reversal_entry(
   p_seq_no int,
   p_entry_no text,
   p_reversal_date date,
-  p_reason text
+  p_reason text,
+  p_line_ids jsonb
 )
 returns uuid
 language plpgsql
@@ -88,10 +97,19 @@ set search_path = public
 as $$
 declare
   v_orig record;
+  v_orig_line_count int;
+  v_mapped_line_count int;
+  v_line record;
+  v_new_line_id_text text;
+  v_uuid_regex text := '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
 begin
-  -- 1. Validate inputs
+  -- 1. Validate client-provided header identifiers & line ID map
   if p_reversal_id is null or p_series_code is null or p_seq_no is null or p_entry_no is null then
-    raise exception 'All reversal identification parameters (id, series, seq_no, entry_no) must be provided by client';
+    raise exception 'All reversal header parameters (p_reversal_id, p_series_code, p_seq_no, p_entry_no) must be provided by client';
+  end if;
+
+  if p_line_ids is null or jsonb_typeof(p_line_ids) <> 'object' then
+    raise exception 'p_line_ids must be a JSONB object mapping original line_no (as text) to client-generated UUID';
   end if;
 
   -- 2. Fetch and validate original entry
@@ -107,8 +125,32 @@ begin
     raise exception 'Cannot reverse non-posted journal entry (current status: %)', v_orig.status;
   end if;
 
-  -- 3. Insert Reversing Entry Header as 'draft'
-  -- (Must be draft initially so check_entry_balanced trigger does not fire before lines exist)
+  -- 3. Verify every active original line has a valid RFC 4122 UUID in p_line_ids
+  select count(*) into v_orig_line_count
+  from journal_lines
+  where entry_id = p_original_entry_id and deleted_at is null;
+
+  if v_orig_line_count < 2 then
+    raise exception 'Original journal entry % must have at least 2 active lines to reverse', p_original_entry_id;
+  end if;
+
+  v_mapped_line_count := 0;
+  for v_line in
+    select line_no from journal_lines where entry_id = p_original_entry_id and deleted_at is null
+  loop
+    v_new_line_id_text := p_line_ids ->> v_line.line_no::text;
+    if v_new_line_id_text is null or not (v_new_line_id_text ~* v_uuid_regex) then
+      raise exception 'Missing or invalid client UUID in p_line_ids for line_no %', v_line.line_no;
+    end if;
+    v_mapped_line_count := v_mapped_line_count + 1;
+  end loop;
+
+  if v_mapped_line_count <> v_orig_line_count then
+    raise exception 'Client p_line_ids map count mismatch';
+  end if;
+
+  -- 4. Insert Reversing Entry Header as 'draft'
+  -- (Must insert as 'draft' first because check_entry_balanced fires BEFORE INSERT/UPDATE when status = 'posted')
   insert into journal_entries (
     id, branch_id, series_code, seq_no, entry_no, entry_date,
     description, source_type, source_id, status, reverses_entry_id
@@ -119,16 +161,13 @@ begin
     'reversal', v_orig.id, 'draft', v_orig.id
   );
 
-  -- 4. Insert Inverted Lines (Debit becomes Credit, Credit becomes Debit)
-  -- Uses client-provided reversal entry id
+  -- 5. Insert Inverted Lines using ONLY client-provided UUIDs from p_line_ids
   insert into journal_lines (
     id, entry_id, line_no, account_id, party_id, cost_center_id,
-    debit, credit, memo
+    debit, credit, currency_code, fx_amount, memo
   )
   select
-    -- In standard client-driven offline architecture, line IDs can be derived or passed.
-    -- For draft reversal helper, generate lines referencing p_reversal_id:
-    extensions.uuid_generate_v4(),
+    (p_line_ids ->> line_no::text)::uuid,
     p_reversal_id,
     line_no,
     account_id,
@@ -136,17 +175,19 @@ begin
     cost_center_id,
     credit as debit,  -- Inverted
     debit as credit,  -- Inverted
+    currency_code,
+    fx_amount,
     'عكس للبند: ' || coalesce(memo, '')
   from journal_lines
   where entry_id = p_original_entry_id and deleted_at is null;
 
-  -- 5. Post the reversal entry atomically (triggers check_entry_balanced)
+  -- 6. Post the reversal entry atomically (triggers check_entry_balanced & require_open_period on p_reversal_date)
   update journal_entries
   set status = 'posted', posted_at = clock_timestamp()
   where id = p_reversal_id;
 
-  -- 6. Mark original entry as reversed
-  -- Allowed by block_posted_changes trigger: `if new.status = 'reversed' and old.status = 'posted' then return new;`
+  -- 7. Mark original entry as reversed
+  -- Allowed by block_posted_changes (005 line 25) and skipped by require_open_period (005 line 56)
   update journal_entries
   set status = 'reversed'
   where id = p_original_entry_id;
