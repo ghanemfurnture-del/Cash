@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
 import 'fake-indexeddb/auto';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import Dexie from 'dexie';
 import { db } from '../src/db';
 import {
   BACKUP_ERRORS,
@@ -460,6 +461,77 @@ describe('Phase 2b-3b: Encrypted Backup, Restore with Preview, & Storage Persist
     ).rejects.toThrow(BACKUP_ERRORS.SAFETY_SNAPSHOT_FAILED);
 
     // Assert local document is untouched
+    const docAfter = await db.documents.get(localDoc.id);
+    expect(docAfter?.seq_no).toBe(42);
+    expect(docAfter?.doc_no).toBe('INV-D1-000042');
+  });
+
+  it('cleans up cash_safety_snapshot_temp and preserves cause when snapshot write fails inside try block', async () => {
+    const localDoc = {
+      id: '00000000-0000-0000-0000-000000000099',
+      branch_id: '00000000-0000-0000-0000-000000000001',
+      doc_type: 'sales_invoice' as const,
+      series_code: 'D1',
+      seq_no: 42,
+      doc_no: 'INV-D1-000042',
+      doc_date: '2026-11-04',
+      status: 'draft' as const,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      version: 1,
+      server_seq: 42,
+    };
+    await db.documents.put(localDoc);
+
+    const encrypted = await exportEncryptedBackup('Secret123!', {
+      iterations: TEST_ITERATIONS,
+    });
+    const preview = await inspectBackupFile(encrypted, 'Secret123!', {
+      iterations: TEST_ITERATIONS,
+    });
+
+    const injectedWriteError = new DOMException(
+      'QuotaExceededError: simulated snapshot write failure',
+      'QuotaExceededError'
+    );
+    const origOpen = Dexie.prototype.open;
+    const openSpy = vi.spyOn(Dexie.prototype, 'open').mockImplementation(function (this: Dexie) {
+      if (this.name === 'cash_safety_snapshot_temp') {
+        return origOpen.call(this).then((openedDb) => {
+          const docsTable = (
+            openedDb as unknown as Record<string, { bulkPut?: (...args: unknown[]) => Promise<unknown> }>
+          ).documents;
+          if (docsTable) {
+            docsTable.bulkPut = async () => {
+              throw injectedWriteError;
+            };
+          }
+          return openedDb;
+        });
+      }
+      return origOpen.call(this);
+    });
+    const deleteSpy = vi.spyOn(Dexie, 'delete');
+
+    try {
+      let caughtError: unknown;
+      try {
+        await executeRestore(preview);
+      } catch (err) {
+        caughtError = err;
+      }
+
+      expect(caughtError).toBeInstanceOf(Error);
+      expect((caughtError as Error).message).toBe(BACKUP_ERRORS.SAFETY_SNAPSHOT_FAILED);
+      expect((caughtError as Error & { cause?: unknown }).cause).toBe(injectedWriteError);
+      expect(deleteSpy).toHaveBeenCalledWith('cash_safety_snapshot_temp');
+    } finally {
+      openSpy.mockRestore();
+      deleteSpy.mockRestore();
+    }
+
+    expect(await Dexie.exists('cash_safety_snapshot_temp')).toBe(false);
+
     const docAfter = await db.documents.get(localDoc.id);
     expect(docAfter?.seq_no).toBe(42);
     expect(docAfter?.doc_no).toBe('INV-D1-000042');
