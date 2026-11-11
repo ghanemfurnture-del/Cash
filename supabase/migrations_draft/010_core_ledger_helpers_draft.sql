@@ -1,5 +1,5 @@
 -- ==============================================================================
--- DRAFT MIGRATION: 009_core_ledger_helpers_draft.sql
+-- DRAFT MIGRATION: 010_core_ledger_helpers_draft.sql
 -- Module: Phase 3 Core Ledger Helpers, Performance Indexes, and Reversal Utility
 -- Status: DRAFT / SPECIFICATION ONLY (NOT APPLIED TO DATABASE)
 -- Note: Bundle ingestion for documents+journal is specified for sync_push_document

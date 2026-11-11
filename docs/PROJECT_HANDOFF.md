@@ -59,7 +59,7 @@ E:/cash/
 │   │   └── sync/                          # شاشة إدارة وفض النزاعات المتزامنة (SyncConflictsPage)
 │   └── services/                          # الخدمات التشغيلية المحلية والاتصال
 │       ├── backup/                        # منطق التشفير AES-256-GCM، والاستعادة، واللقطات
-│       ├── db/                            # قاعدة بيانات Dexie IndexedDB (13 جدولاً + تحكم)
+│       ├── db/                            # قاعدة بيانات Dexie IndexedDB (66 جدولاً مطابقاً + 2 محلياً؛ 13 في CORE_BACKUP_TABLES)
 │       ├── supabase/                      # عميل الاتصال بالسيرفر Supabase Client
 │       └── sync/                          # محرك المزامنة (SyncEngine) وخدمة النزاعات
 ├── supabase/                              # بنية الخادم الخلفي (PostgreSQL 17.11 و Edge Functions)
@@ -75,9 +75,14 @@ E:/cash/
 │   │   ├── 007_sync_engine_rpcs.sql       # دالة sync_push_document وحزم المستندات الذرية
 │   │   └── 008_sync_push_document_hardening.sql # تعزيز أمان sync_push_document ودالة الصلاحيات
 │   ├── migrations_draft/                  # مسودات هجرات مستقبلية للمراحل القادمة
-│   │   ├── 009_eta_readiness.sql          # مسودة حقول منظومة الفاتورة الإلكترونية المصرية
-│   │   └── 009_seed_tax_defaults_draft.sql # مسودة بذور الضرائب وشجرة الحسابات
+│   │   ├── 009_posted_children_and_period_hardening_draft.sql # مسودة تصليب block_posted_children ومنع تداخل الفترات
+│   │   ├── 010_core_ledger_helpers_draft.sql # مسودة مساعدات النواة المحاسبية وميزان المراجعة والقيود العكسية
+│   │   ├── 011_eta_readiness.sql          # مسودة حقول منظومة الفاتورة الإلكترونية المصرية
+│   │   └── 012_seed_tax_defaults_draft.sql # مسودة بذور الضرائب وشجرة الحسابات
 │   └── tests/                             # ملفات SQL لاختبارات قاعدة البيانات وتنتهي بـ ROLLBACK
+│       ├── draft_010_ledger_validation_test.sql # اختبار التحقق لمسودة النواة المحاسبية 010
+│       ├── draft_hardening_apply_and_test.sql # تطبيق مسودة 009 محلياً والتحقق من الإغلاق
+│       ├── draft_hardening_posted_children_test.sql # إثبات ثغرة إعادة ربط البنود على 001-008
 │       ├── migration_008_validation_test.sql # اختبار التحقق الشامل للهجرة 008 (7 سيناريوهات)
 │       ├── rls_and_ledger_validation_test.sql # اختبار سياسات RLS ومحفزات القيود
 │       └── sync_engine_validation_test.sql # اختبار حزم المستندات ومحرك المزامنة
@@ -166,7 +171,7 @@ E:/cash/
 1. **المرحلة 1: التأسيس والمعمارية (Architecture & Rules):**
    - اعتماد مبادئ العمل دون اتصال، توليد المعرفات في العميل، نافذة الـ 120 ثانية العائمة، والترقيم المتسلسل المستقل.
 2. **المرحلة 2a: مرآة قاعدة البيانات المحلية وتطبيق الـ PWA:**
-   - بناء الـ 13 جدولاً في Dexie، محفظة العمليات المعلقة `outbox`، دعم العمل التام دون اتصال، وتوافق كامل باللغة العربية.
+   - بناء الـ 66 جدولاً المطابقة لـ PostgreSQL مع جدولَي `outbox` و `sync_meta` في Dexie (مجموع 68 جدولاً محلياً؛ بينما تشمل `CORE_BACKUP_TABLES` حالياً 13 جدولاً)، ودعم العمل التام دون اتصال، وتوافق كامل باللغة العربية.
 3. **المرحلة 2b-1: الأمان السحابي ومحفزات الحصانة:**
    - عزل الفروع في RLS ومنع التعديل على السجلات المعتمدة برمجياً وقاعدياً.
 4. **المرحلة 2b-2: محرك المزامنة المحصن وعزل الشبكة:**
@@ -295,4 +300,4 @@ npm run scan:secrets
 
 ---
 
-> **ملاحظة للمهندس أو الوكيل التالي:** هذا المستند يمثل النقطة المرجعية الحاكمة (`Single Source of Truth`). عند بدء العمل في المرحلة 3، ابدأ بالاطلاع على مسودة الهجرة المحاسبية [`supabase/migrations_draft/009_eta_readiness.sql`](file:///e:/cash/supabase/migrations_draft/009_eta_readiness.sql) ودليل الحسابات [`docs/chart_of_accounts_proposal.md`](file:///e:/cash/docs/chart_of_accounts_proposal.md).
+> **ملاحظة للمهندس أو الوكيل التالي:** هذا المستند يمثل النقطة المرجعية الحاكمة (`Single Source of Truth`). عند بدء العمل في المرحلة 3، ابدأ بالاطلاع على مسودة التصليب المحاسبي [`supabase/migrations_draft/009_posted_children_and_period_hardening_draft.sql`](file:///e:/cash/supabase/migrations_draft/009_posted_children_and_period_hardening_draft.sql) ومساعدات النواة المحاسبية [`supabase/migrations_draft/010_core_ledger_helpers_draft.sql`](file:///e:/cash/supabase/migrations_draft/010_core_ledger_helpers_draft.sql) ووثيقة التصميم [`docs/phase_3_design.md`](file:///e:/cash/docs/phase_3_design.md) ودليل الحسابات [`docs/chart_of_accounts_proposal.md`](file:///e:/cash/docs/chart_of_accounts_proposal.md). (أما مسودتا [`011_eta_readiness.sql`](file:///e:/cash/supabase/migrations_draft/011_eta_readiness.sql) و[`012_seed_tax_defaults_draft.sql`](file:///e:/cash/supabase/migrations_draft/012_seed_tax_defaults_draft.sql) فمخصصتان لمرحلة الفوترة الإلكترونية والضرائب).

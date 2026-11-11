@@ -1,10 +1,10 @@
 BEGIN;
 
 -- =====================================================================
--- supabase/tests/draft_009_ledger_validation_test.sql
+-- supabase/tests/draft_010_ledger_validation_test.sql
 -- Phase 3 Draft Verification Suite: Ledger Invariants & Double-Entry Rules
 -- Self-contained test suite using deterministic 2099 fixtures and inline
--- draft helper definition so it runs cleanly without applying migration 009.
+-- draft helper definition so it runs cleanly without applying migration 010.
 -- Verified against real schemas 001-008:
 --   - fiscal_years (id, name, start_date, end_date, status)
 --   - fiscal_periods (id, fiscal_year_id, start_date, end_date, status)

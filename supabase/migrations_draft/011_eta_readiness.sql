@@ -1,5 +1,5 @@
 -- =====================================================================
--- supabase/migrations_draft/009_eta_readiness.sql
+-- supabase/migrations_draft/011_eta_readiness.sql
 -- DRAFT ONLY - DO NOT APPLY TO DATABASE IN THIS PHASE
 --
 -- Phase 3+ Preparation: Egyptian Tax Authority (ETA) E-Invoicing Schema Readiness

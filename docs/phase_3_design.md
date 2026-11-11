@@ -207,16 +207,17 @@ journal entry ... not balanced (debit 0, credit 0, lines 0)
 
 ## 8. مسودات الهجرات للمرحلة 3 (Draft Migrations)
 
-1. **`supabase/migrations_draft/009_core_ledger_helpers_draft.sql` (المرحلة 3):** مساعدات النواة المحاسبية، قيود التحقق الإضافية، فهارس الأداء، دالة ميزان المراجعة، ودالة إنشاء القيود العكسية المتوافقة مع أرقام ومعرفات العميل (`p_line_ids jsonb`).
-2. **تحديث `sync_push_document` (المرحلة 3):** دمج استيعاب الفاتورة وقيدها ذرياً في هجرة معتمدة للمرحلة 3.
-3. **`010_eta_readiness.sql` (المرحلة 4):** أعمدة وتجهيزات منظومة الفاتورة الإلكترونية المصرية.
-4. **`011_seed_tax_defaults_draft.sql` (المرحلة 4):** بذور الجداول الضريبية وشجرة الحسابات الأولية.
+1. **`supabase/migrations_draft/009_posted_children_and_period_hardening_draft.sql` (المرحلة 3 - تصليب أمني):** تصليب دالة `block_posted_children()` لفحص `OLD` و `NEW` معاً ومنع تداخل `fiscal_periods` عبر قيد استبعاد `GiST` (`excl_fiscal_periods_no_overlap`).
+2. **`supabase/migrations_draft/010_core_ledger_helpers_draft.sql` (المرحلة 3):** مساعدات النواة المحاسبية، قيود التحقق الإضافية، فهارس الأداء، دالة ميزان المراجعة، ودالة إنشاء القيود العكسية المتوافقة مع أرقام ومعرفات العميل (`p_line_ids jsonb`).
+3. **تحديث `sync_push_document` (المرحلة 3):** دمج استيعاب الفاتورة وقيدها ذرياً في هجرة معتمدة للمرحلة 3.
+4. **`supabase/migrations_draft/011_eta_readiness.sql` (المرحلة 4):** أعمدة وتجهيزات منظومة الفاتورة الإلكترونية المصرية.
+5. **`supabase/migrations_draft/012_seed_tax_defaults_draft.sql` (المرحلة 4):** بذور الجداول الضريبية وشجرة الحسابات الأولية.
 
 ---
 
 ## 9. خطة اختبارات المرحلة 3 (Phase 3 Test Suite)
 
-- اختبارات النواة وقواعد القيد المزدوج تدار عبر السكربت [`supabase/tests/draft_009_ledger_validation_test.sql`](file:///e:/cash/supabase/tests/draft_009_ledger_validation_test.sql) (مستقل بذاته بـ fixtures عام `2099` وتعريف دالة العكس داخله وينتهي بـ `ROLLBACK;`):
+- اختبارات النواة وقواعد القيد المزدوج تدار عبر السكربت [`supabase/tests/draft_010_ledger_validation_test.sql`](file:///e:/cash/supabase/tests/draft_010_ledger_validation_test.sql) (مستقل بذاته بـ fixtures عام `2099` وتعريف دالة العكس داخله وينتهي بـ `ROLLBACK;`):
   1. قبول القيد المتوازن وترحيله بنجاح.
   2. رفض القيد غير المتوازن عبر `check_entry_balanced`.
   3. حظر تعديل بنود القيد المعتمد **وحظر `INSERT` بند جديد** في قيد `posted` عبر `block_posted_children`.

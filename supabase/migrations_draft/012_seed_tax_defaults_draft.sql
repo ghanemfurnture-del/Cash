@@ -1,5 +1,5 @@
 -- =====================================================================
--- supabase/migrations_draft/009_seed_tax_defaults_draft.sql
+-- supabase/migrations_draft/012_seed_tax_defaults_draft.sql
 -- DRAFT SEED SCRIPT ONLY - DO NOT APPLY TO DATABASE IN THIS PHASE
 --
 -- Inserts default Egyptian tax codes and withholding rates as configurable data.
